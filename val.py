@@ -18,7 +18,12 @@ Usage - formats:
                               yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
                               yolov5s_paddle_model       # PaddlePaddle
 """
-
+# New #
+import timm
+from torchvision import transforms
+from subnet import SubnetV1, SubnetV2
+import cv2
+# New #
 import argparse
 import json
 import os
@@ -45,6 +50,19 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
+def get_cls_model():
+    model = timm.create_model("tf_efficientnet_b0", num_classes=4)
+    checkpoint = torch.load(
+        "/home/htluc/vocal-folds/checkpoints/cls_tf_effnet_b0_fold_0_best.pth"
+    )["model"]
+    model.load_state_dict(overwrite_key(checkpoint))
+    model.cuda()
+    return model
+
+def overwrite_key(state_dict):
+    for key in list(state_dict.keys()):
+        state_dict[key.replace("model.", "")] = state_dict.pop(key)
+    return state_dict
 
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
@@ -194,6 +212,23 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
+    
+    # New #
+    # cls_model = get_cls_model()
+    # cls_transform = transforms.Compose(
+    #         [
+    #             transforms.ToTensor(),
+    #             transforms.Resize((256, 256)),
+    #             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    #         ]
+    # )
+    # subnet = SubnetV2(roip_output_size=(8, 8), dim=896)
+    # subnet.load_state_dict(torch.load("/home/htluc/yolov5/subnet_v2.pt"))
+    # subnet.cuda()
+    # cls_model.eval()
+    # subnet.eval()
+    # New #
+    
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
         with dt[0]:
@@ -206,11 +241,12 @@ def run(
 
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            # preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+           small, medium, large, preds = model(im, feature_map=True) if compute_loss else model(im, augment=augment, feature_map=True)
 
         # Loss
-        if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+        # if compute_loss:
+        #     loss += compute_loss(train_out, targets)[1]  # box, obj, cls
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
@@ -224,6 +260,52 @@ def run(
                                         agnostic=single_cls,
                                         max_det=max_det)
 
+        # New #
+        
+        # prediction_list = []
+        # for elem in preds[0].cpu().numpy().tolist():
+        #     prediction_list = []
+        #     cls = int(elem[-1])
+        #     if cls not in [2, 3]:
+        #         continue
+        #     _box = elem[:4]
+        #     _box[2], _box[3] = _box[0] + _box[2], _box[1] + _box[3]
+        #     prediction_list.append(_box)
+            
+        # if len(prediction_list) > 0:
+        #     my_pred = torch.tensor([prediction_list])
+            
+        #     x = cv2.imread(paths[0])[::-1]
+        #     x = cls_transform(x.copy()).unsqueeze(0).cuda()
+
+        #     # Get classification label and global feature
+        #     with torch.no_grad():
+        #         global_feature = cls_model.forward_features(x)
+                
+        #     subnet_pred = subnet(
+        #         (my_pred,
+        #         [(small[0], medium[0], large[0])],
+        #         global_feature[0].unsqueeze(0),
+        #         torch.tensor([0], dtype=torch.long))
+        #     )
+        #     subnet_pred = torch.argmax(subnet_pred[0], dim=1).cpu().numpy().tolist()
+            
+        #     new_pred = []
+        #     print("before")
+        #     print(preds)
+        #     for ix, pred in enumerate(preds[0]):
+        #         pred = pred.cpu().numpy().tolist()
+        #         if int(pred[-1]) in [2, 3] and subnet_pred[0] in [2, 3]:
+        #             pred[5] = subnet_pred[0]
+        #         new_pred.append(pred)
+        #     preds = torch.tensor(new_pred).to(device)
+        #     preds = [preds]
+        #     print("after")
+        #     print(preds)
+                    
+                
+        # New #
+        
         # Metrics
         for si, pred in enumerate(preds):
             labels = targets[targets[:, 0] == si, 1:]
