@@ -51,4 +51,4 @@ cd /home/htluc/yolov5
 # --verbose \
 # --name 'nosubnet' \
 
-python subnet.py
+python /home/htluc/yolov5/my_scripts/subnet.py

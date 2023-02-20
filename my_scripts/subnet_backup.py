@@ -17,13 +17,16 @@ from torchvision.ops import roi_pool
 
 
 import numpy as np
+from PIL import Image
 import cv2
 from sklearn.metrics import f1_score
 
 from models.common import DetectMultiBackend
-from utils.general import non_max_suppression, LOGGER
-from utils.torch_utils import select_device
+from utils.general import non_max_suppression, check_img_size, Profile, LOGGER
+from utils.torch_utils import select_device, smart_inference_mode
 from utils.augmentations import letterbox
+
+# from transformerv2 import Attention, TransformerBlock
 
 def overwrite_key(state_dict):
     for key in list(state_dict.keys()):
@@ -56,6 +59,148 @@ def get_yolo_model():
     imgsz = [480, 480]
     model.warmup(imgsz=(1 if model.pt or model.triton else 4, 3, *imgsz))
     return model
+
+
+# def get_transform():
+#     tf = transforms.Compose(
+#         [
+#             transforms.ToTensor(),
+#             transforms.Resize((256, 256)),
+#             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+#         ]
+#     )
+#     return tf
+
+
+# class YoloDataset(Dataset):
+#     def __init__(
+#         self,
+#         root_dir,
+#         detection_model_path="/home/louis/code/vofo/checkpoints/yolov5s_lesions_only_best.pt",
+#         transform=None,
+#         target_transform=None,
+#     ):
+#         self.root_dir = root_dir
+#         self.detection_model_path = detection_model_path
+#         self.transform = transform
+#         self.target_transform = target_transform
+#         self.img_dir = os.path.join(self.root_dir, "images")
+#         self.label_dir = os.path.join(self.root_dir, "labels")
+#         self.data = []
+
+#         for ix, img in enumerate(natsorted(os.listdir(self.img_dir))):
+#             label_file = os.path.join(self.label_dir, img.split(".")[0] + ".txt")
+#             with open(label_file, "r") as f:
+#                 if f.read(1) == "" or f.read(1) == None:
+#                     cls = -1
+#                 else:
+#                     cls = int(f.read(1))
+#             self.data.append({"img_path": os.path.join(self.img_dir, img), "cls": cls})
+
+#     def __len__(self):
+#         return len(self.data)
+
+#     def __getitem__(self, idx):
+#         x_path, y = self.data[idx]["img_path"], self.data[idx]["cls"]
+#         x = cv2.imread(x_path)
+#         x = letterbox(x, (480, 480), auto=True, stride=32)[0]
+#         x = x.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+#         x = np.ascontiguousarray(x)
+#         if self.transform:
+#             x = self.transform(x.copy())
+#         if self.target_transform:
+#             y = self.target_transform(y)
+#         return x, y, x_path
+
+
+# class ClsDataset(Dataset):
+#     def __init__(self, root_dir, transform=None, target_transform=None):
+#         self.root_dir = root_dir
+#         self.transform = transform
+#         self.target_transform = target_transform
+#         self.img_dir = os.path.join(self.root_dir, "images", "Train_4classes")
+#         self.label_dir = os.path.join(self.root_dir, "labels")
+#         self.data = []
+
+#         with open("/home/htluc/datasets/aim/annotations/annotation_0_val.json") as f:
+#             js = json.load(f)
+
+#         cls_dict = {}
+#         for image in js["images"]:
+#             cls = image["file_name"].split("_")[0]
+#             filename = image["file_name"].split("_")[-1]
+#             cls_dict[filename] = cls
+
+#         for ix, (img, ori) in enumerate(
+#             zip(natsorted(os.listdir(self.img_dir)), js["images"])
+#         ):
+#             # label_file = os.path.join(self.label_dir, img.split(".")[0] + ".txt")
+#             # with open(label_file, "r") as f:
+#             #     if f.read(1) == "" or f.read(1) == None:
+#             #         cls = -1
+#             #     else:
+#             #         cls = int(f.read(1))
+#             if not img in cls_dict.keys():
+#                 continue
+#             self.data.append(
+#                 {
+#                     "img_path": os.path.join(self.img_dir, img),
+#                     "cls_name": cls_dict[img],
+#                     # "cls": cls
+#                 }
+#             )
+
+#     def __len__(self):
+#         return len(self.data)
+
+#     def __getitem__(self, idx):
+#         x_path, y = self.data[idx]["img_path"], self.data[idx]["cls_name"]
+#         x = cv2.imread(x_path)[::-1]
+#         if self.transform:
+#             x = self.transform(x.copy())
+#         if self.target_transform:
+#             y = self.target_transform(y)
+#         return x, y, x_path
+
+
+# def save_yolo_features(train_loader, model):
+#     features_train_path = Path("/home/louis/code/vofo/features/yolo/train")
+#     for x, y, x_path in train_loader:
+#         x = x.to(model.device)
+#         x = x.half() if model.fp16 else x.float()  # uint8 to fp16/32
+#         x /= 255
+#         pred = model(x)
+#         feature_maps = pred[1]
+#         pred = non_max_suppression(
+#             pred, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False
+#         )
+#         feature_maps = [
+#             [x, y, z]
+#             for x, y, z in zip(feature_maps[0], feature_maps[1], feature_maps[2])
+#         ]
+#         for bbox, feature_map, img_path in zip(pred, feature_maps, x_path):
+#             if bbox.shape[0] > 0:
+#                 torch.save(
+#                     bbox, "{}_bbox.pt".format(features_train_path / Path(img_path).stem)
+#                 )
+#             for feature in zip(feature_map[0], feature_map[1], feature_map[2]):
+#                 torch.save(
+#                     feature,
+#                     "{}_feature_map.pt".format(
+#                         features_train_path / Path(img_path).stem
+#                     ),
+#                 )
+
+
+# def save_cls_features(train_loader, model):
+#     features_train_path = Path("/home/louis/code/vofo/features/cls/val")
+#     for x, y, x_path in train_loader:
+#         x = x.cuda()
+#         pred = model.forward_features(x)
+#         for feature, img_path in zip(pred, x_path):
+#             torch.save(
+#                 feature, "{}.pt".format(features_train_path / Path(img_path).stem)
+#             )
 
 
 class SubnetDataset(Dataset):
@@ -171,7 +316,12 @@ def collate_fn(batch):
         list_cls.append(cls)
     if len(list_bbox_tensor) <= 0:
         return None
-    return (list_bbox_tensor, list_local_feature_tuple, torch.stack(list_global_feature_tensor)), torch.tensor(list_cls, dtype=torch.long)
+    return (
+        list_bbox_tensor,
+        list_local_feature_tuple,
+        torch.stack(list_global_feature_tensor),
+        torch.tensor(list_cls, dtype=torch.long),
+    )
 
 
 class SubnetV1(nn.Module):
@@ -204,7 +354,7 @@ class SubnetV1(nn.Module):
         )
 
     def forward(self, x, debug=False):
-        bbox, local_embed, global_embed = x
+        bbox, local_embed, global_embed, target = x
 
         bbox = [x.to(self.device) for x in bbox]
         large_conv = torch.stack([x[2].to(self.device) for x in local_embed])
@@ -252,18 +402,20 @@ class SubnetV1(nn.Module):
             LOGGER.info("Local+Global: {}".format(global_local_feature.shape))
             
         global_feature = []
-        for b, embedding in zip(bbox, global_embed):
+        target_list = []
+        for b, embedding, cls in zip(bbox, global_embed, target):
             _global_feature = embedding.expand(
                 b.shape[0], -1, -1, -1
             )
             global_feature.append(_global_feature)
+            target_list.extend([cls] * b.shape[0])
         global_feature = torch.cat(global_feature, dim=0).to(self.device)
         global_feature = self.conv11_attn_feature(torch.tensor(global_feature))
         x = self.tf(global_local_feature, global_feature, debug=debug)
         x = self.conv11_fc(x)
         x = x.flatten(1)
         x = self.fc(x)
-        return x
+        return x, torch.tensor(target_list, dtype=torch.long)
 
 
 class SubnetV2(nn.Module):
@@ -276,7 +428,7 @@ class SubnetV2(nn.Module):
         device="cuda:0",
     ):
         super().__init__()
-        from transformerv2 import Attention, TransformerBlock
+        from yolov5.transformerv2_backup import Attention, TransformerBlock
         self.roip_output_size = roip_output_size
         self.dim = dim
         self.num_heads = num_heads
@@ -285,6 +437,8 @@ class SubnetV2(nn.Module):
         self.tf = TransformerBlock(dim)
         self.conv11_global = nn.Conv2d(1280, 896, kernel_size=1)
         self.conv11_fc = nn.Conv2d(896, 64, kernel_size=1)
+        # self.conv11_feat1 = nn.Conv2d(1280, 896, kernel_size=1)
+        # self.conv11_feat2 = nn.Conv2d(896, 64, kernel_size=1)
         self.fc = nn.Sequential(
             nn.Linear(4096, 512),
             nn.ReLU(),
@@ -294,7 +448,7 @@ class SubnetV2(nn.Module):
         )
 
     def forward(self, x, debug=False):
-        bbox, local_embed, global_embed = x
+        bbox, local_embed, global_embed, target = x
 
         bbox = [x.to(self.device) for x in bbox]
         small_conv = torch.stack([x[0].to(self.device) for x in local_embed])
@@ -334,11 +488,13 @@ class SubnetV2(nn.Module):
             LOGGER.info("Local feature: {}".format(local_feature.shape))
 
         global_feature = []
-        for b, embedding in zip(bbox, global_embed):
+        target_list = []
+        for b, embedding, cls in zip(bbox, global_embed, target):
             _global_feature = embedding.expand(
                 b.shape[0], -1, -1, -1
             )
             global_feature.append(_global_feature)
+            target_list.extend([cls] * b.shape[0])
         global_feature = torch.cat(global_feature, dim=0).to(self.device)
         global_feature = self.conv11_global(global_feature)
         
@@ -346,7 +502,7 @@ class SubnetV2(nn.Module):
         x = self.conv11_fc(x)
         x = x.flatten(1)
         x = self.fc(x)
-        return x
+        return x, torch.tensor(target_list, dtype=torch.long)
 
 
 def metrics_batch(output, target):
@@ -373,16 +529,11 @@ def loss_epoch(model, loss_func, dataset_dl, opt=None):
     micro_score = 0.0
     weighted_score = 0.0
     count = 0
-    for ix, (x, y) in enumerate(dataset_dl):
-        bbox, _, _ = x
-        ylist = []
-        for b, cls in zip(bbox, y):
-            ylist.extend([cls] * b.shape[0])
-        y = torch.tensor(ylist, dtype=torch.long)
-        output = model(x, debug=False)
-        y = y.to(model.device)
+    for ix, x in enumerate(dataset_dl):
+        output, yb = model(x, debug=False)
+        yb = yb.to(model.device)
         # get loss per batch
-        loss_b, metric_b = loss_batch(loss_func, output, y, opt)
+        loss_b, metric_b = loss_batch(loss_func, output, yb, opt)
         # update running loss
         running_loss += loss_b
         # update running metric
@@ -496,11 +647,12 @@ if __name__ == "__main__":
         val_ds, batch_size=128, drop_last=True, collate_fn=collate_fn, shuffle=True
     )
 
-    model = SubnetV1(roip_output_size=(8, 8), dim=896)
+    # model = SubnetV1(roip_output_size=(8, 8), dim=896)
+    model = SubnetV2(roip_output_size=(8, 8), dim=896)
     loss_func = nn.CrossEntropyLoss()
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.5, patience=5, verbose=1
+        opt, mode="min", factor=0.5, patience=20, verbose=1
     )
 
     params_train = {
@@ -510,13 +662,13 @@ if __name__ == "__main__":
         "train_dl": train_dl,
         "val_dl": val_dl,
         "lr_scheduler": lr_scheduler,
-        "path2weights": "/home/htluc/yolov5/subnet_v1.pt",
+        "path2weights": "/home/htluc/yolov5/subnet_v2.pt",
     }
 
     model, loss_hist, metric_hist = train_subnet(model, params_train)
 
-    with open('subnet_v1_loss.json', 'w') as fp:
+    with open('subnet_v2_loss.json', 'w') as fp:
         json.dump(loss_hist, fp)
         
-    with open('subnet_v1_metric.json', 'w') as fp:
+    with open('subnet_v2_metric.json', 'w') as fp:
         json.dump(metric_hist, fp)
