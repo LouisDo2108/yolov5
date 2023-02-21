@@ -1,3 +1,6 @@
+my_scripts/runs/*
+my_scripts/checkpoints/*
+
 # Repo-specific GitIgnore ----------------------------------------------------------------------------------------------
 *.jpg
 *.jpeg

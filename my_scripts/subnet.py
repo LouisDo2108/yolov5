@@ -8,8 +8,11 @@ import json
 import sys
 import os
 
-# SCRIPT_DIR = os.path.dirname(os.path.abspath("/home/htluc/yolov5/detect.py"))
-# sys.path.append(os.path.dirname(SCRIPT_DIR))
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[0]  # YOLOv5 root directory
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 from detect import run
 
 import timm
@@ -31,6 +34,7 @@ from utils.torch_utils import select_device
 from utils.augmentations import letterbox
 
 from transformer import TransformerBlockV1, TransformerBlockV2
+
 
 def overwrite_key(state_dict):
     for key in list(state_dict.keys()):
@@ -54,7 +58,7 @@ def get_yolo_model():
     device = ""
     device = select_device(device)
     model = DetectMultiBackend(
-        weights="/home/htluc/yolov5/runs/train/yolov5s_fold_0/weights/best.pt", #"/home/htluc/yolov5/runs/train/yolov5s_lesions_fold_0/weights/best.pt",
+        weights="/home/htluc/yolov5/runs/train/yolov5s_fold_0/weights/best.pt",  # "/home/htluc/yolov5/runs/train/yolov5s_lesions_fold_0/weights/best.pt",
         device=device,
         dnn=dnn,
         data=None,
@@ -120,7 +124,10 @@ class SubnetDataset(Dataset):
         img_path, cls = self.data["img_path"][idx], self.data["cls"][idx]
         # Get yolo features and bbox
         img = cv2.imread(img_path)
-        x = letterbox(img.copy(), (480, 480), auto=True, stride=32)[0]
+        x = letterbox(img.copy(), 480, auto=False, stride=32)[0]
+        # x = letterbox(img.copy(), (480, 480), auto=True, stride=32)[0]
+        # LOGGER.info("x letter box shape {}".format(x.shape))
+        LOGGER.info("x letter box shape {}".format(x.shape))
         x = x.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         x = torch.from_numpy(np.ascontiguousarray(x)).unsqueeze(0).cuda()
         x = x.half() if self.yolo_model.fp16 else x.float()  # uint8 to fp16/32
@@ -130,8 +137,8 @@ class SubnetDataset(Dataset):
         pred = non_max_suppression(
             pred, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False
         )
-        
-        # Filter bbox with lesions        
+
+        # Filter bbox with lesions
         prediction_list = []
         for elem in pred[0].cpu().numpy().tolist():
             prediction_list = []
@@ -140,7 +147,7 @@ class SubnetDataset(Dataset):
                 continue
             prediction_list.append(elem)
         pred = torch.tensor([prediction_list])
-                
+
         if pred[0].shape[0] <= 0:
             return None, 1, 1, 1
 
@@ -178,7 +185,11 @@ def collate_fn(batch):
         list_cls.append(cls)
     if len(list_bbox_tensor) <= 0:
         return None
-    return (list_bbox_tensor, list_local_feature_tuple, torch.stack(list_global_feature_tensor)), torch.tensor(list_cls, dtype=torch.long)
+    return (
+        list_bbox_tensor,
+        list_local_feature_tuple,
+        torch.stack(list_global_feature_tensor),
+    ), torch.tensor(list_cls, dtype=torch.long)
 
 
 class SubnetV1(nn.Module):
@@ -243,9 +254,12 @@ class SubnetV1(nn.Module):
             output_size=self.roip_output_size,
             spatial_scale=1 / 45.0,
         )
-        
+        # LOGGER.info("\n{}".format(x0.shape))
+        # LOGGER.info("\n{}".format(x1.shape))
         local_feature = self.conv11_local(torch.cat((x0, x1, x2), dim=1))
-        global_local_feature = torch.cat((local_feature, self.conv11_global_pooling(global_feature)), dim=1)
+        global_local_feature = torch.cat(
+            (local_feature, self.conv11_global_pooling(global_feature)), dim=1
+        )
 
         if debug:
             LOGGER.info("LargeConv: {}".format(large_conv.shape))
@@ -256,12 +270,10 @@ class SubnetV1(nn.Module):
             LOGGER.info("X2: {}".format(x2.shape))
             LOGGER.info("Local feature: {}".format(local_feature.shape))
             LOGGER.info("Local+Global: {}".format(global_local_feature.shape))
-            
+
         global_feature = []
         for b, embedding in zip(bbox, global_embed):
-            _global_feature = embedding.expand(
-                b.shape[0], -1, -1, -1
-            )
+            _global_feature = embedding.expand(b.shape[0], -1, -1, -1)
             global_feature.append(_global_feature)
         global_feature = torch.cat(global_feature, dim=0).to(self.device)
         global_feature = self.conv11_attn_feature(torch.tensor(global_feature))
@@ -340,13 +352,11 @@ class SubnetV2(nn.Module):
 
         global_feature = []
         for b, embedding in zip(bbox, global_embed):
-            _global_feature = embedding.expand(
-                b.shape[0], -1, -1, -1
-            )
+            _global_feature = embedding.expand(b.shape[0], -1, -1, -1)
             global_feature.append(_global_feature)
         global_feature = torch.cat(global_feature, dim=0).to(self.device)
         global_feature = self.conv11_global(global_feature)
-        
+
         x = self.tf(local_feature, global_feature, debug=debug)
         x = self.conv11_fc(x)
         x = x.flatten(1)
@@ -396,10 +406,10 @@ def loss_epoch(model, loss_func, dataset_dl, opt=None):
             weighted_score += metric_b[1]
         count += 1
     # average loss value
-    loss = running_loss / count #float(len_data)
+    loss = running_loss / count  # float(len_data)
     # average metric value
-    micro_metric = micro_score / count #float(len_data)
-    weighted_metric = weighted_score / count #float(len_data)
+    micro_metric = micro_score / count  # float(len_data)
+    weighted_metric = weighted_score / count  # float(len_data)
     return loss, (micro_metric, weighted_metric)
 
 
@@ -425,14 +435,8 @@ def train_subnet(model, params):
     }
     # history of metric values in each epoch
     metric_history = {
-        "train": {
-            "micro":    [],
-            "weighted": []
-        },
-        "val": {
-            "micro":    [],
-            "weighted": []
-        }
+        "train": {"micro": [], "weighted": []},
+        "val": {"micro": [], "weighted": []},
     }
 
     # a deep copy of weights for the best performing model
@@ -485,7 +489,7 @@ def train_subnet(model, params):
             )
         )
         LOGGER.info("-" * 10)
-    
+
     return model, loss_history, metric_history
 
 
@@ -515,13 +519,13 @@ if __name__ == "__main__":
         "train_dl": train_dl,
         "val_dl": val_dl,
         "lr_scheduler": lr_scheduler,
-        "path2weights": "/home/htluc/yolov5/subnet_v1.pt",
+        "path2weights": "/home/htluc/yolov5/subnet_v1_test.pt",
     }
 
     model, loss_hist, metric_hist = train_subnet(model, params_train)
 
-    with open('subnet_v1_loss.json', 'w') as fp:
+    with open("subnet_v1_loss.json", "w") as fp:
         json.dump(loss_hist, fp)
-        
-    with open('subnet_v1_metric.json', 'w') as fp:
+
+    with open("subnet_v1_metric.json", "w") as fp:
         json.dump(metric_hist, fp)

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -o %j.out
 #SBATCH --gres=gpu:1
-#SBATCH --nodelist=selab3
+#SBATCH --nodelist=selab2
 #SBATCH --mem-per-cpu=4GB
 #SBATCH --time=999:00:00
 
@@ -44,11 +44,11 @@ cd /home/htluc/yolov5
 # --verbose \
 # --name 'yolov5s_benign_malignant_fold_0_val' \
 
-# python val.py \
-# --img 480 --batch 1 \
-# --data /home/htluc/datasets/aim_folds/fold_0/annotations/aim_fold_0.yaml \
-# --weights /home/htluc/yolov5/runs/train/yolov5s_fold_0/weights/best.pt \
-# --verbose \
-# --name 'nosubnet' \
+python /home/htluc/yolov5/my_scripts/val.py \
+--img 480 --batch 1 \
+--data /home/htluc/datasets/aim_folds/fold_0/annotations/aim_fold_0.yaml \
+--weights /home/htluc/yolov5/runs/train/yolov5s_fold_0/weights/best.pt \
+--verbose \
+--name 'subnetv2'
 
-python /home/htluc/yolov5/my_scripts/subnet.py
+# python /home/htluc/yolov5/my_scripts/subnet.py

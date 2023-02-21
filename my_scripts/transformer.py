@@ -8,11 +8,11 @@ import numbers
 
 
 def to_3d(x):
-    return rearrange(x, 'b c h w -> b (h w) c')
+    return rearrange(x, "b c h w -> b (h w) c")
 
 
-def to_4d(x,h,w):
-    return rearrange(x, 'b (h w) c -> b c h w',h=h,w=w)
+def to_4d(x, h, w):
+    return rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
 
 
 class BiasFree_LayerNorm(nn.Module):
@@ -29,7 +29,7 @@ class BiasFree_LayerNorm(nn.Module):
 
     def forward(self, x):
         sigma = x.var(-1, keepdim=True, unbiased=False)
-        return x / torch.sqrt(sigma+1e-5) * self.weight
+        return x / torch.sqrt(sigma + 1e-5) * self.weight
 
 
 class WithBias_LayerNorm(nn.Module):
@@ -48,13 +48,13 @@ class WithBias_LayerNorm(nn.Module):
     def forward(self, x):
         mu = x.mean(-1, keepdim=True)
         sigma = x.var(-1, keepdim=True, unbiased=False)
-        return (x - mu) / torch.sqrt(sigma+1e-5) * self.weight + self.bias
+        return (x - mu) / torch.sqrt(sigma + 1e-5) * self.weight + self.bias
 
 
 class LayerNorm(nn.Module):
     def __init__(self, dim, LayerNorm_type):
         super(LayerNorm, self).__init__()
-        if LayerNorm_type =='BiasFree':
+        if LayerNorm_type == "BiasFree":
             self.body = BiasFree_LayerNorm(dim)
         else:
             self.body = WithBias_LayerNorm(dim)
@@ -73,8 +73,15 @@ class GFeedForward(nn.Module):
 
         self.project_in = nn.Conv2d(dim, hidden_features * 2, kernel_size=1, bias=bias)
 
-        self.dwconv = nn.Conv2d(hidden_features * 2, hidden_features * 2, kernel_size=3, stride=1, padding=1,
-                                groups=hidden_features * 2, bias=bias)
+        self.dwconv = nn.Conv2d(
+            hidden_features * 2,
+            hidden_features * 2,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=hidden_features * 2,
+            bias=bias,
+        )
 
         self.project_out = nn.Conv2d(hidden_features, dim, kernel_size=1, bias=bias)
 
@@ -95,28 +102,36 @@ class AttentionV1(nn.Module):
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
         self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
-        self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(
+            dim * 3,
+            dim * 3,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=dim * 3,
+            bias=bias,
+        )
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
 
     def forward(self, x, feature, debug=False):
         b, c, h, w = x.shape
 
         qkv = self.qkv_dwconv(self.qkv(x))
-        
+
         q, k, v = qkv.chunk(3, dim=1)
 
-        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        
+        q = rearrange(q, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+        k = rearrange(k, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+        v = rearrange(v, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+
         # New
-        feature = torch.reshape(feature, (b, self.num_heads, -1, h*w))
+        feature = torch.reshape(feature, (b, self.num_heads, -1, h * w))
         if debug:
             LOGGER.info("q: {}".format(q.shape))
             LOGGER.info("k: {}".format(q.shape))
             LOGGER.info("v: {}".format(q.shape))
             LOGGER.info("Reshaped Attn Feature: {}".format(feature.shape))
-        
+
         q = torch.mul(q, feature)
         k = torch.mul(k, feature)
         # New
@@ -127,9 +142,11 @@ class AttentionV1(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.temperature
         attn = attn.softmax(dim=-1)
 
-        out = (attn @ v)
+        out = attn @ v
 
-        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        out = rearrange(
+            out, "b head c (h w) -> b (head c) h w", head=self.num_heads, h=h, w=w
+        )
 
         out = self.project_out(out)
         return out
@@ -142,24 +159,32 @@ class AttentionV2(nn.Module):
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
         self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
-        self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(
+            dim * 3,
+            dim * 3,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=dim * 3,
+            bias=bias,
+        )
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
 
     def forward(self, local_feature, global_feature, debug=False):
         b, c, h, w = local_feature.shape
 
         # qkv = self.qkv_dwconv(self.qkv(x))
-        
+
         # q, k, v = qkv.chunk(3, dim=1)
-        
+
         q = local_feature
         k = global_feature
         v = global_feature
 
-        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        
+        q = rearrange(q, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+        k = rearrange(k, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+        v = rearrange(v, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+
         # New
         if debug:
             LOGGER.info("q: {}".format(q.shape))
@@ -173,16 +198,25 @@ class AttentionV2(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.temperature
         attn = attn.softmax(dim=-1)
 
-        out = (attn @ v)
+        out = attn @ v
 
-        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        out = rearrange(
+            out, "b head c (h w) -> b (head c) h w", head=self.num_heads, h=h, w=w
+        )
 
         out = self.project_out(out)
         return out
 
 
 class TransformerBlockV1(nn.Module):
-    def __init__(self, dim=48, num_heads=8, ffn_expansion_factor=2.66, bias=False, LayerNorm_type=WithBias_LayerNorm):
+    def __init__(
+        self,
+        dim=48,
+        num_heads=8,
+        ffn_expansion_factor=2.66,
+        bias=False,
+        LayerNorm_type=WithBias_LayerNorm,
+    ):
         super(TransformerBlockV1, self).__init__()
 
         self.norm1 = LayerNorm(dim, LayerNorm_type)
@@ -195,10 +229,17 @@ class TransformerBlockV1(nn.Module):
         x = x + self.ffn(self.norm2(x))
 
         return x
-    
-    
+
+
 class TransformerBlockV2(nn.Module):
-    def __init__(self, dim=48, num_heads=8, ffn_expansion_factor=2.66, bias=False, LayerNorm_type=WithBias_LayerNorm):
+    def __init__(
+        self,
+        dim=48,
+        num_heads=8,
+        ffn_expansion_factor=2.66,
+        bias=False,
+        LayerNorm_type=WithBias_LayerNorm,
+    ):
         super(TransformerBlockV2, self).__init__()
 
         self.norm1 = LayerNorm(dim, LayerNorm_type)

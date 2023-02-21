@@ -18,11 +18,14 @@ Usage - formats:
                               yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
                               yolov5s_paddle_model       # PaddlePaddle
 """
-
+# New #
+import timm
+from torchvision import transforms
+import cv2
+# New #
 import argparse
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -36,6 +39,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
+from subnet import SubnetV1, SubnetV2
 from models.common import DetectMultiBackend
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
@@ -46,6 +50,19 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
+def get_cls_model():
+    model = timm.create_model("tf_efficientnet_b0", num_classes=4)
+    checkpoint = torch.load(
+        "/home/htluc/vocal-folds/checkpoints/cls_tf_effnet_b0_fold_0_best.pth"
+    )["model"]
+    model.load_state_dict(overwrite_key(checkpoint))
+    model.cuda()
+    return model
+
+def overwrite_key(state_dict):
+    for key in list(state_dict.keys()):
+        state_dict[key.replace("model.", "")] = state_dict.pop(key)
+    return state_dict
 
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
@@ -170,7 +187,7 @@ def run(
             assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
                               f'classes). Pass correct combination of --weights and --data that are trained together.'
         model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
-        pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
+        pad, rect = (0.0, False)# if task == 'speed' else (0.5, pt)  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task],
                                        imgsz,
@@ -195,6 +212,23 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
+    
+    # New #
+    cls_model = get_cls_model()
+    cls_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Resize((256, 256)),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+    )
+    subnet = SubnetV2(roip_output_size=(8, 8), dim=896)
+    subnet.load_state_dict(torch.load("/home/htluc/yolov5/my_scripts/checkpoints/subnet_v2.pt"))
+    subnet.cuda()
+    cls_model.eval()
+    subnet.eval()
+    # New #
+    
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
         with dt[0]:
@@ -204,14 +238,11 @@ def run(
             im = im.half() if half else im.float()  # uint8 to fp16/32
             im /= 255  # 0 - 255 to 0.0 - 1.0
             nb, _, height, width = im.shape  # batch size, channels, height, width
-
+            # LOGGER.info("im.shape: {}".format(im.shape))
+            
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
-
-        # Loss
-        if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+           small, medium, large, preds = model(im, feature_map=True) if compute_loss else model(im, augment=augment, feature_map=True)
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
@@ -224,7 +255,77 @@ def run(
                                         multi_label=True,
                                         agnostic=single_cls,
                                         max_det=max_det)
+        # print("before")                   
+        # print(preds)
+        # New #
+        list_bbox_tensor = []
+        list_local_feature_tuple = []
+        list_global_feature_tensor = []
+        list_global_feature_tensor_preliminary = []
+        
+        for path in paths:
+            x = cv2.imread(path)[::-1]
+            x = cls_transform(x.copy()).unsqueeze(0).cuda()
 
+            # Get classification label and global feature
+            with torch.no_grad():
+                global_feature = cls_model.forward_features(x)[0]
+            list_global_feature_tensor_preliminary.append(global_feature)
+        
+        
+        for bbox, s, m, l, global_feature in zip(preds, small, medium, large, list_global_feature_tensor_preliminary):
+            if bbox.shape[0] <= 0:
+                continue
+            new_box = []
+            _bbox = bbox.clone().cpu().numpy()
+            for box in _bbox:
+                if int(box[-1]) in [2, 3]:
+                    new_box.append(box)
+            if len(new_box) <= 0:
+                continue
+            new_box = np.array(new_box)[:, :4]
+            new_box[:, 2], new_box[:, 3] = new_box[:, 0] + new_box[:, 2], new_box[:, 1] + new_box[:, 3]
+            list_bbox_tensor.append(torch.tensor(new_box))
+            list_local_feature_tuple.append((s, m, l))
+            list_global_feature_tensor.append(global_feature)
+        # return
+        # List bbox tensor have to be processed by batch
+        if len(list_bbox_tensor) > 0:
+            subnet_pred_preliminary = subnet((
+                list_bbox_tensor,
+                list_local_feature_tuple,
+                torch.stack(list_global_feature_tensor)
+            ))
+            subnet_pred_preliminary = torch.argmax(subnet_pred_preliminary, dim=1).cpu().numpy().tolist()
+            # LOGGER.info("\n subnet_pred_preliminary: {}".format(subnet_pred_preliminary))
+            subnet_pred = []
+            last_index = 0
+            for box in list_bbox_tensor:
+                if len(box) <= 0:
+                    subnet_pred.append(-1)
+                    continue
+                number_of_boxes = box.shape[0]
+                u, c = np.unique(np.array(subnet_pred_preliminary[last_index:last_index+number_of_boxes]), return_counts = True)
+
+                y = u[c == c.max()].tolist()[0]
+                subnet_pred.append(y)
+                last_index = number_of_boxes
+            # LOGGER.info("\n subnet_pred: {}".format(subnet_pred))
+            _preds = []
+            for img, subnet_cls in zip(preds, subnet_pred):
+                new_pred = []
+                subnet_cls = int(subnet_cls)
+                for pred in img: 
+                    pred = pred.cpu().numpy().tolist()
+                    if int(pred[-1]) in [2, 3] and subnet_cls in [2, 3]:
+                        pred[5] = subnet_cls
+                    new_pred.append(pred)
+                _preds.append(torch.tensor(new_pred).to(device))
+            preds = _preds
+        # print("after")                   
+        # print(preds)
+        # New #
+        
         # Metrics
         for si, pred in enumerate(preds):
             labels = targets[targets[:, 0] == si, 1:]
@@ -265,8 +366,11 @@ def run(
 
         # Plot images
         if plots and batch_i < 3:
-            plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
-            plot_images(im, output_to_target(preds), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
+            try:
+                plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
+                plot_images(im, output_to_target(preds), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
+            except Exception as e:
+                print(e)
 
         callbacks.run('on_val_batch_end', batch_i, im, targets, paths, shapes, preds)
 
@@ -304,7 +408,7 @@ def run(
     if save_json and len(jdict):
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
         anno_json = str(Path('../datasets/coco/annotations/instances_val2017.json'))  # annotations
-        pred_json = str(save_dir / f'{w}_predictions.json')  # predictions
+        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions
         LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
         with open(pred_json, 'w') as f:
             json.dump(jdict, f)
@@ -398,12 +502,13 @@ def main(opt):
                     r, _, t = run(**vars(opt), plots=False)
                     y.append(r + t)  # results and times
                 np.savetxt(f, y, fmt='%10.4g')  # save
-            subprocess.run(['zip', '-r', 'study.zip', 'study_*.txt'])
+            os.system('zip -r study.zip study_*.txt')
             plot_val_study(x=x)  # plot
         else:
             raise NotImplementedError(f'--task {opt.task} not in ("train", "val", "test", "speed", "study")')
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     opt = parse_opt()
     main(opt)
+
