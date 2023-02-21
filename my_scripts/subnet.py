@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 from copy import deepcopy
-from pprint import pprint
 from natsort import natsorted
 import json
 
@@ -9,16 +8,15 @@ import sys
 import os
 
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # YOLOv5 root directory
+ROOT = FILE.parents[1]  # YOLOv5 root directory
+print("ROOT", ROOT)
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
-from detect import run
 
 import timm
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.ops import roi_pool
@@ -27,6 +25,7 @@ from torchvision.ops import roi_pool
 import numpy as np
 import cv2
 from sklearn.metrics import f1_score
+import albumentations as A
 
 from models.common import DetectMultiBackend
 from utils.general import non_max_suppression, LOGGER
@@ -166,6 +165,103 @@ class SubnetDataset(Dataset):
         )
 
 
+class SubnetDataset_New(Dataset):
+    def __init__(self, root_dir, train_val, transform=None, target_transform=None):
+        self.root_dir = root_dir
+        self.train_val = train_val
+        self.transform = A.Compose([
+            A.augmentations.crops.transforms.RandomSizedBBoxSafeCrop(360, 480),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(p=0.2),
+        ], bbox_params=A.BboxParams(format='coco', label_fields=["bbox_categories"]))
+        self.target_transform = target_transform
+        self.img_dir = os.path.join(self.root_dir, "images", "Train_4classes")
+        
+        self.yolo_model = get_yolo_model()
+        self.cls_model = get_cls_model()
+        self.yolo_model.eval()
+        self.cls_model.eval()
+        self.yolo_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+            ]
+        )
+        self.cls_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Resize((256, 256)),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+
+        with open(
+            "/home/htluc/datasets/aim/annotations/annotation_0_{}.json".format(
+                train_val
+            )
+        ) as f:
+            js = json.load(f)
+
+        self.data = []
+        # First loop -> Extract class, img_path, file_name
+        self.label_dict = {"Nor-VF": 0, "Non-VF": 1, "Ben-VF": 2, "Mag-VF": 3} # set the labels' order
+        self.categories = js["categories"]
+            
+        for image in js["images"]:
+            new_dict = {}
+            cls = image["file_name"].split("_")[0] # Extract the class id from the orignal image name
+            filename = image["file_name"].split("_")[-1] # Get the image name in the image folder
+            new_dict["id"] = image["id"]
+            new_dict["file_name"] = filename
+            new_dict["img_path"] = os.path.join(self.img_dir, filename)
+            new_dict["bbox"] = []
+            new_dict["bbox_categories"] = []
+            new_dict["cls"] = self.label_dict[cls]
+            self.data.append(new_dict)
+        
+        
+        # Second loop -> Add bbox
+        for annot in js["annotations"]:
+            for img_data in self.data:
+                if img_data["id"] == annot["image_id"]:
+                    img_data["bbox"].append(annot["bbox"])
+                    img_data["bbox_categories"].append(annot["category_id"])
+                    break
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        data = self.data[idx]
+        img_path, bboxes, bbox_categories, cls = data["img_path"], data["bbox"], data["bbox_categories"], data["cls"]
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Get yolo features and bbox
+        if self.transform:
+            transformed = self.transform(image=img, bboxes=bboxes, bbox_categories=bbox_categories)
+            img = transformed['image']
+            bboxes = transformed['bboxes']
+            bbox_categories = transformed["bbox_categories"]
+        
+        
+        x = letterbox(img.copy(), 480, auto=False, stride=32)[0]
+        x = x.transpose((2, 0, 1))#[::-1]  # HWC to CHW, BGR to RGB
+        x = torch.from_numpy(np.ascontiguousarray(x)).unsqueeze(0).cuda()
+        x = x.half() if self.yolo_model.fp16 else x.float()  # uint8 to fp16/32
+        x /= 255
+        with torch.no_grad():
+            small, medium, large, pred = self.yolo_model(x, feature_map=True)
+
+        x = img.copy()
+        x = self.cls_transform(x.copy()).unsqueeze(0).cuda()
+
+        # Get classification label and global feature
+        with torch.no_grad():
+            global_feature = self.cls_model.forward_features(x)
+
+        return (small[0], medium[0], large[0], global_feature[0]), cls
+        
+
 def collate_fn(batch):
     list_bbox_tensor = []
     list_local_feature_tuple = []
@@ -254,8 +350,6 @@ class SubnetV1(nn.Module):
             output_size=self.roip_output_size,
             spatial_scale=1 / 45.0,
         )
-        # LOGGER.info("\n{}".format(x0.shape))
-        # LOGGER.info("\n{}".format(x1.shape))
         local_feature = self.conv11_local(torch.cat((x0, x1, x2), dim=1))
         global_local_feature = torch.cat(
             (local_feature, self.conv11_global_pooling(global_feature)), dim=1

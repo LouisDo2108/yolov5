@@ -1,5 +1,7 @@
 my_scripts/runs/*
 my_scripts/checkpoints/*
+*.out
+slurm_run.sh
 
 # Repo-specific GitIgnore ----------------------------------------------------------------------------------------------
 *.jpg
