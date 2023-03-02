@@ -39,7 +39,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from my_scripts.subnet import SubnetV1_New, SubnetV2_New
+from my_scripts.subnet import SubnetV1_New, SubnetV2_New, SubnetV3_New
 from models.common import DetectMultiBackend
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
@@ -50,6 +50,7 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
+
 def get_cls_model():
     model = timm.create_model("tf_efficientnet_b0", num_classes=4)
     checkpoint = torch.load(
@@ -59,10 +60,24 @@ def get_cls_model():
     model.cuda()
     return model
 
+
+def get_subnet(model_path, v=1):
+    if v == 1:
+        subnet = SubnetV1_New(roip_output_size=(8, 8), dim=896)
+    elif v == 2:
+        subnet = SubnetV2_New(roip_output_size=(8, 8), dim=896)
+    elif v == 3:
+        subnet = SubnetV3_New(roip_output_size=(8, 8), dim=896)
+    subnet.load_state_dict(torch.load(model_path))
+    subnet.cuda()
+    return subnet
+
+
 def overwrite_key(state_dict):
     for key in list(state_dict.keys()):
         state_dict[key.replace("model.", "")] = state_dict.pop(key)
     return state_dict
+
 
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
@@ -215,16 +230,14 @@ def run(
     
     # New #
     cls_model = get_cls_model()
-    cls_transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize((256, 256)),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-    )
-    subnet = SubnetV1_New(roip_output_size=(8, 8), dim=896)
-    subnet.load_state_dict(torch.load("/home/htluc/yolov5/subnet_v1.pt"))
-    subnet.cuda()
+    cls_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Resize((256, 256)),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    subnet = get_subnet(
+        model_path="/home/htluc/yolov5/my_scripts/checkpoints/new/subnet_v1.pt", 
+        v=1)
     cls_model.eval()
     subnet.eval()
     # New #
@@ -256,34 +269,33 @@ def run(
                                         agnostic=single_cls,
                                         max_det=max_det)
         # New #
-        # print("before")                   
-        # print(preds)
-        
+        print("Before\n", preds)
         # Get global feature
         for path in paths:
-            x = cv2.imread(path)[::-1]
-            x = cls_transform(x.copy()).unsqueeze(0).cuda()
+            # Read image
+            image = cv2.imread(path)[::-1]
+            # Apply transformation and convert to tensor
+            image = cls_transform(image.copy()).unsqueeze(0).cuda()
 
             with torch.no_grad():
-                global_feature = cls_model.forward_features(x)
-    
-        # Get the bbox output from yolo        
-        _preds = preds[0].clone()
-        _preds[:, 2], _preds[:, 3] = _preds[:, 0] + _preds[:, 2], _preds[:, 1] + _preds[:, 3]
-        bboxes = [_preds[:, :4]]
+                # Get global feature vector from classification model
+                global_feature = cls_model.forward_features(image)
+
+        # Get bounding box output from YOLO
+        bbox_preds = preds[0].clone()
+        # Convert predictions to absolute coordinates
+        bbox_preds[:, 2], bbox_preds[:, 3] = bbox_preds[:, 0] + bbox_preds[:, 2], bbox_preds[:, 1] + bbox_preds[:, 3]
+        bboxes = [bbox_preds[:, :4]]
 
         # If there are bbox predictions, process the new prediction logic
         if bboxes[0].shape[0] > 0:
-            
-            # Get the prediction from the dedicated subnet
-            subnet_pred_preliminary = subnet(
-                (small, medium, large, bboxes, global_feature)
-            )
-            # print("Subnet predictions:", subnet_pred_preliminary)
+            # Get subnet predictions
+            subnet_pred_preliminary = subnet((small, medium, large, bboxes, global_feature))
             # Get classification prediction for each bounding box
             subnet_pred_preliminary = torch.argmax(subnet_pred_preliminary, dim=1).cpu().numpy().tolist()
-            # print("subnet_pred_preliminary", subnet_pred_preliminary)
+            print("\nsubnet_pred_preliminary", subnet_pred_preliminary)
             subnet_pred = []
+            
             
             # Since an image might have multiple bbox, hence multiple classifications, we do a majority voting
             last_index = 0
@@ -298,34 +310,25 @@ def run(
                 subnet_pred.append(y)
                 last_index = number_of_boxes
             # print("Subnet predictions after majority voting:", subnet_pred)
-            # Replace yolo benign, malignant predictions with subnet's predictions
-            _preds = []
-            # print("yolo_cls", preds[0][:, -1])
+            # Replace YOLO predictions with subnet's predictions
+            print("\subnet_pred", subnet_pred)
+            new_preds = []
             for img, subnet_cls in zip(preds, subnet_pred):
                 new_pred = []
                 subnet_cls = int(subnet_cls)
-                # print("subnet_cls", subnet_cls)
                 for pred in img:
                     pred = pred.cpu().numpy().tolist()
-                    # Newly add #
                     # if subnet_cls == 1 and int(pred[-1]) in [0, 2, 3, 4]: # Non-VF, only cartilages are visible
                     #     continue
                     # if subnet_cls == 0 and int(pred[-1]) in [2, 3]: # Nor-VF, no lesions, ignore all lesions predictions
                     #     continue
-                    # Newly add #
-                    # if subnet_cls in [2, 3] and int(pred[-1]) in [2, 3]: # Lesions, replace with subnet predictions
-                    #     pred[5] = subnet_cls
-                    if int(pred[-1]) in [2, 3]: # Lesions, replace with subnet predictions
-                        if subnet_cls in [2, 3]:
-                            pred[5] = subnet_cls
-                        else:
-                            continue
+                    # If subnet predicts lesions, replace lesion predictions with subnet predictions
+                    if int(pred[-1]) in [2, 3] and subnet_cls in [2, 3]:
+                        pred[5] = subnet_cls
                     new_pred.append(pred)
-                _preds.append(torch.tensor(new_pred).to(device))
-            preds = _preds
-        # print("after")                   
-        # print(preds)
-        # return
+                new_preds.append(torch.tensor(new_pred).to(device))
+            preds = new_preds
+            print("After\n", preds)
         # New #
         
         # Metrics

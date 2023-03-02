@@ -19,6 +19,21 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, default_collate
 from torchvision import transforms
 from torchvision.ops import roi_pool
+def c2_xavier_fill(module: nn.Module) -> None:
+    """
+    Initialize `module.weight` using the "XavierFill" implemented in Caffe2.
+    Also initializes `module.bias` to 0.
+    Args:
+        module (torch.nn.Module): module to initialize.
+    """
+    # Caffe2 implementation of XavierFill in fact
+    # corresponds to kaiming_uniform_ in PyTorch
+    # pyre-fixme[6]: For 1st param expected `Tensor` but got `Union[Module, Tensor]`.
+    nn.init.kaiming_uniform_(module.weight, a=1)
+    if module.bias is not None:
+        # pyre-fixme[6]: Expected `Tensor` for 1st param but got `Union[nn.Module,
+        #  torch.Tensor]`.
+        nn.init.constant_(module.bias, 0)
 
 
 import numpy as np
@@ -31,7 +46,7 @@ from utils.general import non_max_suppression, LOGGER
 from utils.torch_utils import select_device
 from utils.augmentations import letterbox
 
-from transformer import TransformerBlockV1, TransformerBlockV2
+from transformer import * #TransformerBlockV1, TransformerBlockV2, TransformerBlockV3
 
 
 def overwrite_key(state_dict):
@@ -163,56 +178,48 @@ class SubnetDataset(Dataset):
 
 
 class SubnetDataset_new(Dataset):
+    
     def __init__(self, root_dir, train_val, transform=None, target_transform=None):
+        super(SubnetDataset_new, self).__init__()
+        
         self.root_dir = root_dir
         self.train_val = train_val
         self.transform = transform
         self.target_transform = target_transform
-        self.target_transform = target_transform
+        
         self.img_dir = os.path.join(self.root_dir, "images", "Train_4classes")
-
-        self.yolo_model = get_yolo_model()
-        self.cls_model = get_cls_model()
-        self.yolo_model.eval()
-        self.cls_model.eval()
-        self.yolo_transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-            ]
-        )
-        self.cls_transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize((256, 256)),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-        )
-
-        with open(
-            "/home/htluc/datasets/aim/annotations/annotation_0_{}.json".format(
-                train_val
-            )
-        ) as f:
-            js = json.load(f)
-
-        self.data = []
-        # First loop -> Extract class, img_path, file_name
         self.label_dict = {
             "Nor-VF": 0,
             "Non-VF": 1,
             "Ben-VF": 2,
             "Mag-VF": 3,
         }  # set the labels' order
+
+        self.yolo_model = get_yolo_model()
+        self.cls_model = get_cls_model()
+        self.yolo_model.eval()
+        self.cls_model.eval()
+        self.yolo_transform = transforms.ToTensor()
+        self.cls_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((256, 256)),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+        with open("/home/htluc/datasets/aim/annotations/annotation_0_{}.json".format(train_val)) as f:
+            js = json.load(f)
+            
+        self.data = []
+        self.image_id_to_index = {}
         self.categories = js["categories"]
 
-        for image in js["images"]:
+        for i, image in enumerate(js["images"]):
             new_dict = {}
-            cls = image["file_name"].split("_")[
-                0
-            ]  # Extract the class id from the orignal image name
-            filename = image["file_name"].split("_")[
-                -1
-            ]  # Get the image name in the image folder
+            # Extract the class id from the orignal image name
+            cls = image["file_name"].split("_")[0]
+            # Get the image name in the image folder
+            filename = image["file_name"].split("_")[-1]
+
             new_dict["id"] = image["id"]
             new_dict["file_name"] = filename
             new_dict["img_path"] = os.path.join(self.img_dir, filename)
@@ -220,66 +227,63 @@ class SubnetDataset_new(Dataset):
             new_dict["bbox_categories"] = []
             new_dict["cls"] = self.label_dict[cls]
             self.data.append(new_dict)
+            self.image_id_to_index[image["id"]] = i
 
         # Second loop -> Add bbox
         for annot in js["annotations"]:
-            for img_data in self.data:
-                if img_data["id"] == annot["image_id"]:
-                    img_data["bbox"].append(annot["bbox"])
-                    img_data["bbox_categories"].append(annot["category_id"])
-                    break
+            img_index = self.image_id_to_index[annot["image_id"]]
+            img_data = self.data[img_index]
+            img_data["bbox"].append(annot["bbox"])
+            img_data["bbox_categories"].append(annot["category_id"])
 
     def __len__(self):
         return len(self.data)
-
+    
     def __getitem__(self, idx):
+        # Retrieve data from the dataset at the given index
         data = self.data[idx]
-        img_path, bboxes, bbox_categories, cls = (
-            data["img_path"],
-            data["bbox"],
-            data["bbox_categories"],
-            data["cls"],
-        )
+
+        # Extract image path, bounding boxes, bbox categories, and class ID
+        img_path = data["img_path"]
+        bboxes = data.get("bbox", [])
+        bbox_categories = data.get("bbox_categories", [])
+        cls = data["cls"]
+
+        # Load image from path
         img = cv2.imread(img_path)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        if len(bboxes) <= 0:
+
+        # If no bounding boxes are found, add a default bounding box
+        if not bboxes:
             bboxes.append([0, 0, img.shape[1], img.shape[0]])
             bbox_categories.append(7)
-            
+
+        # Apply image transforms if available
         if self.transform:
-            transformed = self.transform(
-                image=img, bboxes=bboxes, bbox_categories=bbox_categories
-            )
+            transformed = self.transform(image=img, bboxes=bboxes, bbox_categories=bbox_categories)
             img = transformed["image"]
             bboxes = transformed["bboxes"]
             bbox_categories = transformed["bbox_categories"]
-            
+
+        # Apply target transforms if available
         if self.target_transform:
-            transformed = self.target_transform(
-                image=img, bboxes=bboxes, bbox_categories=bbox_categories
-            )
+            transformed = self.target_transform(image=img, bboxes=bboxes, bbox_categories=bbox_categories)
             img = transformed["image"]
             bboxes = transformed["bboxes"]
             bbox_categories = transformed["bbox_categories"]
-        
-        # Get yolo features and bbox
+
+        # Convert image to YOLO format and extract YOLO features and bounding boxes
         x = letterbox(img.copy(), 480, auto=False, stride=32)[0]
-        x = x.transpose((2, 0, 1))  # [::-1]  # HWC to CHW, BGR to RGB
-        x = torch.from_numpy(np.ascontiguousarray(x)).unsqueeze(0).cuda()
-        # LOGGER.info("img_shape", x.shape)
-        x = x.half() if self.yolo_model.fp16 else x.float()  # uint8 to fp16/32
-        x /= 255
+        x = x.transpose((2, 0, 1))
+        x = torch.from_numpy(x).unsqueeze(0).cuda().float().div(255.0)
         with torch.no_grad():
-            small, medium, large, pred = self.yolo_model(x, feature_map=True)
+             small, medium, large, pred = self.yolo_model(x, feature_map=True)
 
-        x = img.copy()
-        x = self.cls_transform(x.copy()).unsqueeze(0).cuda()
-
-        # Get classification label and global feature
+        # Convert image to classification format and extract classification features
+        x = self.cls_transform(img.copy()).unsqueeze(0).cuda()
         with torch.no_grad():
             global_feature = self.cls_model.forward_features(x)
-
+    
         return (small[0], medium[0], large[0], bboxes, global_feature[0]), cls
 
 
@@ -318,13 +322,20 @@ def collate_fn_new(batch):
         bbox_list.append(torch.tensor(x[3]))
         global_feature_list.append(x[4])
         cls_list.append(y)
+        
+    # Collate tensors within each list
+    small_list = default_collate(small_list)
+    medium_list = default_collate(medium_list)
+    large_list = default_collate(large_list)
+    global_feature_list = default_collate(global_feature_list)
+    cls_list = default_collate(cls_list)
     return (
-        default_collate(small_list),
-        default_collate(medium_list),
-        default_collate(large_list),
+        small_list,
+        medium_list,
+        large_list,
         bbox_list,
-        default_collate(global_feature_list),
-    ), default_collate(cls_list)
+        global_feature_list,
+    ), cls_list
 
 
 class SubnetV1(nn.Module):
@@ -432,6 +443,8 @@ class SubnetV1_New(nn.Module):
         self.num_heads = num_heads
         self.bias = bias
         self.device = device
+        
+        # Define the network layers
         self.tf = TransformerBlockV1(dim)
         self.conv11_local = nn.Conv2d(512 + 256 + 128, 448, 1, 1)
         self.conv11_global_pooling = nn.Conv2d(1280, 448, 1, 1)
@@ -446,14 +459,17 @@ class SubnetV1_New(nn.Module):
         )
 
     def forward(self, x, debug=False):
+        # Unpack the input
         small_conv, medium_conv, large_conv, bboxes, global_embed = x
 
+        # Move the data to the GPU
         bbox = [x.to(self.device).float() for x in bboxes]
         large_conv = large_conv.to(self.device).float()
         medium_conv = medium_conv.to(self.device).float()
         small_conv = small_conv.to(self.device).float()
         global_embed = global_embed.to(self.device).float()
         
+        # Apply ROI pooling
         x0 = roi_pool(
             small_conv,
             boxes=bbox,
@@ -472,14 +488,17 @@ class SubnetV1_New(nn.Module):
             output_size=self.roip_output_size,
             spatial_scale=1 / 32.0,
         )
-
         global_feature = roi_pool(
             global_embed,
             boxes=bbox,
             output_size=self.roip_output_size,
             spatial_scale=1 / 45.0,
         )
+        
+        # Stack all local features together
         local_feature = self.conv11_local(torch.cat((x0, x1, x2), dim=1))
+        
+        # Apply global and local feature fusion
         global_local_feature = torch.cat(
             (local_feature, self.conv11_global_pooling(global_feature)), dim=1
         )
@@ -494,11 +513,16 @@ class SubnetV1_New(nn.Module):
             LOGGER.info("Local feature: {}".format(local_feature.shape))
             LOGGER.info("Local+Global: {}".format(global_local_feature.shape))
 
-        global_feature = []
-        for b, embedding in zip(bbox, global_embed):
-            _global_feature = embedding.expand(b.shape[0], -1, -1, -1)
-            global_feature.append(_global_feature)
-        global_feature = torch.cat(global_feature, dim=0).to(self.device)
+        # global_feature = []
+        # for b, embedding in zip(bbox, global_embed):
+        #     _global_feature = embedding.expand(b.shape[0], -1, -1, -1)
+        #     global_feature.append(_global_feature)
+        # global_feature = torch.cat(global_feature, dim=0).to(self.device)
+        global_feature = torch.cat(
+            [embedding.expand(len(b), -1, -1, -1) for b, embedding in zip(bbox, global_embed)], 
+            dim=0
+        ).to(self.device)
+        
         global_feature = self.conv11_attn_feature(torch.tensor(global_feature))
         x = self.tf(global_local_feature, global_feature, debug=debug)
         x = self.conv11_fc(x)
@@ -602,6 +626,8 @@ class SubnetV2_New(nn.Module):
         self.num_heads = num_heads
         self.bias = bias
         self.device = device
+        
+        # Define the network layers
         self.tf = TransformerBlockV2(dim)
         self.conv11_global = nn.Conv2d(1280, 896, kernel_size=1)
         self.conv11_fc = nn.Conv2d(896, 64, kernel_size=1)
@@ -614,14 +640,17 @@ class SubnetV2_New(nn.Module):
         )
 
     def forward(self, x, debug=False):
+        # Unpack the input
         small_conv, medium_conv, large_conv, bboxes, global_embed = x
 
+        # Move the data to the GPU
         bbox = [x.to(self.device).float() for x in bboxes]
         large_conv = large_conv.to(self.device).float()
         medium_conv = medium_conv.to(self.device).float()
         small_conv = small_conv.to(self.device).float()
         global_embed = global_embed.to(self.device).float()
 
+        # Apply ROI pooling
         x0 = roi_pool(
             small_conv,
             boxes=bbox,
@@ -641,6 +670,7 @@ class SubnetV2_New(nn.Module):
             spatial_scale=1 / 24.0,
         )
 
+        # Stack all local features together
         local_feature = torch.cat((x0, x1, x2), dim=1)
 
         if debug:
@@ -652,11 +682,15 @@ class SubnetV2_New(nn.Module):
             LOGGER.info("X2: {}".format(x2.shape))
             LOGGER.info("Local feature: {}".format(local_feature.shape))
 
-        global_feature = []
-        for b, embedding in zip(bbox, global_embed):
-            _global_feature = embedding.expand(b.shape[0], -1, -1, -1)
-            global_feature.append(_global_feature)
-        global_feature = torch.cat(global_feature, dim=0).to(self.device)
+        # global_feature = []
+        # for b, embedding in zip(bbox, global_embed):
+        #     _global_feature = embedding.expand(b.shape[0], -1, -1, -1)
+        #     global_feature.append(_global_feature)
+        # global_feature = torch.cat(global_feature, dim=0).to(self.device)
+        global_feature = torch.cat(
+            [embedding.expand(len(b), -1, -1, -1) for b, embedding in zip(bbox, global_embed)], 
+            dim=0
+        ).to(self.device)
         global_feature = self.conv11_global(global_feature)
 
         x = self.tf(local_feature, global_feature, debug=debug)
@@ -665,6 +699,288 @@ class SubnetV2_New(nn.Module):
         x = self.fc(x)
         return x
 
+
+class SubnetV3_New(nn.Module):
+    def __init__(
+        self,
+        roip_output_size=(36, 36),
+        dim=48,
+        num_heads=8,
+        bias=False,
+        device="cuda:0",
+    ):
+        super().__init__()
+        self.roip_output_size = roip_output_size
+        self.dim = dim
+        self.num_heads = num_heads
+        self.bias = bias
+        self.device = device
+        
+        # Define the network layers
+        self.tf = TransformerBlockV3(dim)
+        self.conv11_global = nn.Conv2d(1280, 896, kernel_size=1)
+        self.conv11_fc = nn.Conv2d(896, 64, kernel_size=1)
+        self.fc = nn.Sequential(
+            nn.Linear(4096, 512),
+            nn.ReLU(),
+            nn.Linear(512, 32),
+            nn.ReLU(),
+            nn.Linear(32, 4),
+        )
+
+    def forward(self, x, debug=False):
+        # Unpack the input
+        small_conv, medium_conv, large_conv, bboxes, global_embed = x
+
+        # Move the data to the GPU
+        bbox = [x.to(self.device).float() for x in bboxes]
+        large_conv = large_conv.to(self.device).float()
+        medium_conv = medium_conv.to(self.device).float()
+        small_conv = small_conv.to(self.device).float()
+        global_embed = global_embed.to(self.device).float()
+
+        # Apply ROI pooling
+        x0 = roi_pool(
+            small_conv,
+            boxes=bbox,
+            output_size=self.roip_output_size,
+            spatial_scale=1 / 6.0,
+        )
+        x1 = roi_pool(
+            medium_conv,
+            boxes=bbox,
+            output_size=self.roip_output_size,
+            spatial_scale=1 / 12.0,
+        )
+        x2 = roi_pool(
+            large_conv,
+            boxes=bbox,
+            output_size=self.roip_output_size,
+            spatial_scale=1 / 24.0,
+        )
+
+        # Stack all local features together
+        local_feature = torch.cat((x0, x1, x2), dim=1)
+
+        if debug:
+            LOGGER.info("LargeConv: {}".format(large_conv.shape))
+            LOGGER.info("MediumConv: {}".format(medium_conv.shape))
+            LOGGER.info("SmallConv: {}".format(small_conv.shape))
+            LOGGER.info("X0: {}".format(x0.shape))
+            LOGGER.info("X1: {}".format(x1.shape))
+            LOGGER.info("X2: {}".format(x2.shape))
+            LOGGER.info("Local feature: {}".format(local_feature.shape))
+
+        # global_feature = []
+        # for b, embedding in zip(bbox, global_embed):
+        #     _global_feature = embedding.expand(b.shape[0], -1, -1, -1)
+        #     global_feature.append(_global_feature)
+        # global_feature = torch.cat(global_feature, dim=0).to(self.device)
+        global_feature = torch.cat(
+            [embedding.expand(len(b), -1, -1, -1) for b, embedding in zip(bbox, global_embed)], 
+            dim=0
+        ).to(self.device)
+        global_feature = self.conv11_global(global_feature)
+        
+        # local_global_fusion_feature = torch.matmul(local_feature, global_feature) # v1
+        local_global_fusion_feature = torch.mul(local_feature, global_feature) # v2
+
+        x = self.tf(local_global_fusion_feature, debug=debug)
+        x = self.conv11_fc(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        return x
+
+
+def get_binary_mask(shape, boxes, fill_value=float('inf')):
+    """
+    Generates a binary mask tensor of size `shape` with values set to `fill_value` inside
+    the bounding boxes specified by `boxes`, and 0 outside the boxes.
+    
+    Args:
+    - shape (tuple[int, int]): The shape of the output binary mask tensor.
+    - boxes (list[list[int]]): A list of bounding box coordinates in the format [x, y, w, h].
+    - fill_value (float): The value to fill inside the bounding boxes. Default is 1.
+    
+    Returns:
+    - binary_mask (torch.Tensor): A binary mask tensor of size `shape`.
+    """
+    binary_mask = torch.zeros(shape)
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        binary_mask[y1:y2, x1:x2] = fill_value
+    return binary_mask
+
+# Replace ROI pooling with Mask SE from Mask2Former
+class SubnetV4_New(nn.Module):
+    def __init__(
+        self,
+        roip_output_size=(36, 36),
+        dim=48,
+        num_heads=8,
+        num_queries=100,
+        bias=False,
+        device="cuda:0",
+    ):
+        super().__init__()
+        # self.roip_output_size = roip_output_size
+        self.dim = dim
+        self.num_heads = num_heads
+        self.num_queries = num_queries
+        self.bias = bias
+        self.device = device
+        
+        # Define the network layers
+        self.tf = TransformerBlockV3(dim)
+        self.conv11_small = nn.Conv2d(512, self.dim, kernel_size=1)
+        self.conv11_medium = nn.Conv2d(256, self.dim, kernel_size=1)
+        self.conv11_large = nn.Conv2d(128, self.dim, kernel_size=1)
+        self.conv11_global = nn.Conv2d(1280, 896, kernel_size=1)
+        self.conv11_fc = nn.Conv2d(896, 64, kernel_size=1)
+        self.fc = nn.Sequential(
+            nn.Linear(4096, 512),
+            nn.ReLU(),
+            nn.Linear(512, 32),
+            nn.ReLU(),
+            nn.Linear(32, 4),
+        )
+        self.mce0 = Mask2Former_CA(
+            self.dim,
+            self.num_heads,
+        )
+        self.mce1 = Mask2Former_CA(
+            self.dim,
+            self.num_heads,
+        )
+        self.mce2 = Mask2Former_CA(
+            self.dim,
+            self.num_heads,
+        )
+        N_steps = self.dim // 2
+        self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
+        self.query_feat = nn.Embedding(self.num_queries, self.dim)
+        self.query_embed = nn.Embedding(self.num_queries, self.dim)
+        self.level_embed = nn.Embedding(1, self.dim)
+        self.resize0 = transforms.Resize((60, 60))
+        self.resize1 = transforms.Resize((30, 30))
+        self.resize2 = transforms.Resize((15, 15))
+
+    def forward(self, x, debug=False):
+        # Unpack the input
+        small_conv, medium_conv, large_conv, bboxes, global_embed = x
+
+        # Move the data to the GPU
+        # bbox = [x.to(self.device).float() for x in bboxes]
+        large_conv = large_conv.to(self.device).float()
+        medium_conv = medium_conv.to(self.device).float()
+        small_conv = small_conv.to(self.device).float()
+        global_embed = global_embed.to(self.device).float()
+        
+        print("Large", large_conv.shape)
+        print("medium", medium_conv.shape)
+        print("small", small_conv.shape)
+        
+        attn_mask_tensor0 = self.get_attn_mask_tensor(self.resize0, bboxes)
+        attn_mask_tensor1 = self.get_attn_mask_tensor(self.resize1, bboxes)
+        attn_mask_tensor2 = self.get_attn_mask_tensor(self.resize2, bboxes)
+        print("attn_mask_tensor0", attn_mask_tensor0.shape)
+        # Apply ROI pooling
+        
+        bs = len(bboxes)
+        
+        tgt0 = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        pos0 = self.pe_layer(small_conv, None).flatten(2).permute(2, 0, 1)
+        query_pos0 = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        memory0 = small_conv.flatten(2) + self.level_embed.weight[0][None, :, None]
+        
+        print("tgt0", tgt0.shape)
+        print("pos0", pos0.shape)
+        print("query_pos0", query_pos0.shape)
+        print("memory0", memory0.shape)
+         
+        x0 = self.mce0(
+            tgt=tgt0,
+            memory=memory0,
+            memory_mask=attn_mask_tensor0,
+            memory_key_padding_mask=None,  # here we do not apply masking on padded region
+            pos=pos0, 
+            query_pos=query_pos0
+        )
+        
+        # x1 = self.mse1(
+        #     medium_conv, tgt_mask=mask_tensor1,
+        #     tgt_key_padding_mask=None,
+        #     query_pos=self.query_embed
+        # )
+        
+        # x2 = self.mse2(
+        #     large_conv, tgt_mask=mask_tensor2,
+        #     tgt_key_padding_mask=None,
+        #     query_pos=self.query_embed
+        # )
+        print("x0.shape", x0.shape)
+        return
+        
+        # x0 = roi_pool(
+        #     small_conv,
+        #     boxes=bbox,
+        #     output_size=self.roip_output_size,
+        #     spatial_scale=1 / 6.0,
+        # )
+        # x1 = roi_pool(
+        #     medium_conv,
+        #     boxes=bbox,
+        #     output_size=self.roip_output_size,
+        #     spatial_scale=1 / 12.0,
+        # )
+        # x2 = roi_pool(
+        #     large_conv,
+        #     boxes=bbox,
+        #     output_size=self.roip_output_size,
+        #     spatial_scale=1 / 24.0,
+        # )
+
+        # Stack all local features together
+        local_feature = torch.cat((x0, x1, x2), dim=1)
+
+        if debug:
+            LOGGER.info("LargeConv: {}".format(large_conv.shape))
+            LOGGER.info("MediumConv: {}".format(medium_conv.shape))
+            LOGGER.info("SmallConv: {}".format(small_conv.shape))
+            LOGGER.info("X0: {}".format(x0.shape))
+            LOGGER.info("X1: {}".format(x1.shape))
+            LOGGER.info("X2: {}".format(x2.shape))
+            LOGGER.info("Local feature: {}".format(local_feature.shape))
+
+        # global_feature = []
+        # for b, embedding in zip(bbox, global_embed):
+        #     _global_feature = embedding.expand(b.shape[0], -1, -1, -1)
+        #     global_feature.append(_global_feature)
+        # global_feature = torch.cat(global_feature, dim=0).to(self.device)
+        global_feature = torch.cat(
+            [embedding.expand(len(b), -1, -1, -1) for b, embedding in zip(bbox, global_embed)], 
+            dim=0
+        ).to(self.device)
+        global_feature = self.conv11_global(global_feature)
+        
+        # local_global_fusion_feature = torch.matmul(local_feature, global_feature) # v1
+        local_global_fusion_feature = torch.mul(local_feature, global_feature) # v2
+
+        x = self.tf(local_global_fusion_feature, debug=debug)
+        x = self.conv11_fc(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        return x
+
+    def get_attn_mask_tensor(self, resize, bbox):
+        mask_list = []
+        for box in bbox:
+            box = box.int().tolist()
+            mask = get_binary_mask((360, 480), box)
+            mask = resize(mask.unsqueeze(0)).squeeze(1)
+            mask_list.append(mask)
+        mask_tensor = torch.stack(mask_list).to(self.device).float()
+        return mask_tensor
 
 def train_subnet(model, params):
 
@@ -934,35 +1250,36 @@ if __name__ == "__main__":
     
     train_ds = SubnetDataset_new("/home/htluc/datasets/aim/", train_val="train", transform=transform)
     train_dl = DataLoader(
-        train_ds, batch_size=64, drop_last=False, collate_fn=collate_fn_new, shuffle=True,
+        train_ds, batch_size=2, drop_last=False, collate_fn=collate_fn_new, shuffle=True,
     )
     
     val_ds = SubnetDataset_new("/home/htluc/datasets/aim/", train_val="val")
     val_dl = DataLoader(
-        val_ds, batch_size=64, drop_last=False, collate_fn=collate_fn_new, shuffle=True
+        val_ds, batch_size=2, drop_last=False, collate_fn=collate_fn_new, shuffle=True
     )
 
-    model = SubnetV2_New(roip_output_size=(8, 8), dim=896)
+    model = SubnetV4_New(roip_output_size=(8, 8), dim=896)
     loss_func = nn.CrossEntropyLoss()
+    # loss_func = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.0, 1.5, 1.5]).cuda(), label_smoothing=0.1)
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=0.5, patience=5, verbose=1
     )
 
     params_train = {
-        "num_epochs": 100,
+        "num_epochs": 2,
         "optimizer": opt,
         "loss_func": loss_func,
         "train_dl": train_dl,
         "val_dl": val_dl,
         "lr_scheduler": lr_scheduler,
-        "path2weights": "/home/htluc/yolov5/subnet_v2.pt",
+        "path2weights": "/home/htluc/yolov5/my_scripts/checkpoints/test/subnet_v4.pt",
     }
 
     model, loss_hist, metric_hist = train_subnet_new(model, params_train)
 
-    with open("subnet_v2_loss.json", "w") as fp:
-        json.dump(loss_hist, fp)
+    # with open("/home/htluc/yolov5/my_scripts/checkpoints/test/subnet_v3_elementwise_loss.json", "w") as fp:
+    #     json.dump(loss_hist, fp)
 
-    with open("subnet_v2_metric.json", "w") as fp:
-        json.dump(metric_hist, fp)
+    # with open("/home/htluc/yolov5/my_scripts/checkpoints/test/subnet_v3_elementwise_metric.json", "w") as fp:
+    #     json.dump(metric_hist, fp)
