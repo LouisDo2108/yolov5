@@ -39,7 +39,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from my_scripts.subnet import SubnetV1_New, SubnetV2_New, SubnetV3_New
+from my_scripts.subnet import *
 from models.common import DetectMultiBackend
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
@@ -51,10 +51,10 @@ from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
 
-def get_cls_model():
+def get_cls_model(fold):
     model = timm.create_model("tf_efficientnet_b0", num_classes=4)
     checkpoint = torch.load(
-        "/home/htluc/vocal-folds/checkpoints/cls_tf_effnet_b0_fold_0_best.pth"
+        "/home/dtpthao/workspace/yolov5/tf{}.pth".format(fold), map_location=torch.device('cpu')
     )["model"]
     model.load_state_dict(overwrite_key(checkpoint))
     model.cuda()
@@ -63,11 +63,15 @@ def get_cls_model():
 
 def get_subnet(model_path, v=1):
     if v == 1:
-        subnet = SubnetV1_New(roip_output_size=(8, 8), dim=896)
+        subnet = SubnetV1(roip_output_size=(8, 8), dim=896)
     elif v == 2:
-        subnet = SubnetV2_New(roip_output_size=(8, 8), dim=896)
+        subnet = SubnetV2(roip_output_size=(8, 8), dim=896)
     elif v == 3:
-        subnet = SubnetV3_New(roip_output_size=(8, 8), dim=896)
+        subnet = SubnetV3(roip_output_size=(8, 8), dim=896)
+    elif v == 41:
+        subnet = SubnetV41(dim=896)
+    elif v == 43:
+        subnet = SubnetV43(roip_output_size=(8, 8), dim=896)
     subnet.load_state_dict(torch.load(model_path))
     subnet.cuda()
     return subnet
@@ -229,15 +233,16 @@ def run(
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
     
     # New #
-    cls_model = get_cls_model()
+    fold = 0
+    cls_model = get_cls_model(fold=fold)
     cls_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Resize((256, 256)),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
     subnet = get_subnet(
-        model_path="/home/htluc/yolov5/my_scripts/checkpoints/new/subnet_v1.pt", 
-        v=1)
+        model_path="/home/dtpthao/workspace/yolov5/my_scripts/subnet_v41_ce_100epochs_fold_0_fix.pt", 
+        v=41)
     cls_model.eval()
     subnet.eval()
     # New #
@@ -269,7 +274,7 @@ def run(
                                         agnostic=single_cls,
                                         max_det=max_det)
         # New #
-        print("Before\n", preds)
+        # print("Before\n", preds)
         # Get global feature
         for path in paths:
             # Read image
@@ -293,25 +298,29 @@ def run(
             subnet_pred_preliminary = subnet((small, medium, large, bboxes, global_feature))
             # Get classification prediction for each bounding box
             subnet_pred_preliminary = torch.argmax(subnet_pred_preliminary, dim=1).cpu().numpy().tolist()
-            print("\nsubnet_pred_preliminary", subnet_pred_preliminary)
+            # print("\nsubnet_pred_preliminary", subnet_pred_preliminary)
             subnet_pred = []
             
             
             # Since an image might have multiple bbox, hence multiple classifications, we do a majority voting
-            last_index = 0
-            for box in bboxes:
-                if len(box) <= 0:
-                    subnet_pred.append(-1)
-                    continue
-                number_of_boxes = box.shape[0]
-                u, c = np.unique(np.array(subnet_pred_preliminary[last_index:last_index+number_of_boxes]), return_counts = True)
+            if isinstance(subnet, SubnetV1) or isinstance(subnet, SubnetV2) or isinstance(subnet, SubnetV3):
+                last_index = 0
+                for box in bboxes:
+                    if len(box) <= 0:
+                        subnet_pred.append(-1)
+                        continue
+                    number_of_boxes = box.shape[0]
+                    u, c = np.unique(np.array(subnet_pred_preliminary[last_index:last_index+number_of_boxes]), return_counts = True)
 
-                y = u[c == c.max()].tolist()[0]
-                subnet_pred.append(y)
-                last_index = number_of_boxes
+                    y = u[c == c.max()].tolist()[0]
+                    subnet_pred.append(y)
+                    last_index = number_of_boxes
+            else:
+                subnet_pred = subnet_pred_preliminary
+
             # print("Subnet predictions after majority voting:", subnet_pred)
             # Replace YOLO predictions with subnet's predictions
-            print("\subnet_pred", subnet_pred)
+            # print("\subnet_pred", subnet_pred)
             new_preds = []
             for img, subnet_cls in zip(preds, subnet_pred):
                 new_pred = []
@@ -328,7 +337,7 @@ def run(
                     new_pred.append(pred)
                 new_preds.append(torch.tensor(new_pred).to(device))
             preds = new_preds
-            print("After\n", preds)
+            # print("After\n", preds)
         # New #
         
         # Metrics
