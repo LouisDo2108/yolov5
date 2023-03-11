@@ -209,7 +209,7 @@ class SubnetDataset(Dataset):
         return (small[0], medium[0], large[0], bboxes, global_embedding[0]), cls
     
     
-def collate_fn_new(batch):
+def collate_fn(batch):
     small_list, medium_list, large_list, bbox_list, global_embedding_list, cls_list = [], [], [], [], [], []
     for x, y in batch:
         small_list.append(x[0])
@@ -678,11 +678,11 @@ def train(model, params, model_name):
 def init_data_loaders(train_transforms, val_transforms, batch_size, fold):
     train_ds = SubnetDataset("/home/dtpthao/workspace/vocal-folds/data/aim", train_val="train",
                                  transform=train_transforms, fold=fold)
-    train_dl = DataLoader(train_ds, batch_size=batch_size, drop_last=False, collate_fn=collate_fn_new, shuffle=True)
+    train_dl = DataLoader(train_ds, batch_size=batch_size, drop_last=False, collate_fn=collate_fn, shuffle=True)
 
     val_ds = SubnetDataset("/home/dtpthao/workspace/vocal-folds/data/aim", train_val="val", fold=fold,
                                transform=val_transforms)
-    val_dl = DataLoader(val_ds, batch_size=batch_size, drop_last=False, collate_fn=collate_fn_new, shuffle=True)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, drop_last=False, collate_fn=collate_fn, shuffle=True)
 
     return train_dl, val_dl
 
