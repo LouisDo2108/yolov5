@@ -52,9 +52,6 @@ for img in gt_json["images"]:
     file_name = int(img["file_name"].split("_")[-1][:-4])
     image_id = int(img["id"])
     id_dict[file_name] = image_id
-    # print(file_name)
-    # if image_id == 921:
-    #     print(file_name)
     
 for ix, item in enumerate(pred_json):
     image_id, cls, bbox, score = item.values()

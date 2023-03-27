@@ -15,10 +15,27 @@ from torch.utils.data import Dataset, DataLoader, default_collate
 from torchvision import transforms
 from torchvision.ops import roi_pool
 
-
 import timm
 from einops import rearrange
 from ranger21 import Ranger21
+
+import argparse
+import math
+import os
+import random
+import sys
+import time
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import yaml
+from torch.optim import lr_scheduler
+from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -33,6 +50,36 @@ from transformer import *
 from utils.general import non_max_suppression, LOGGER
 from utils.torch_utils import select_device
 from utils.augmentations import letterbox
+
+import val as validate  # for end-of-epoch mAP
+from models.experimental import attempt_load
+from models.yolo import Model
+from utils.autoanchor import check_anchors
+from utils.autobatch import check_train_batch_size
+from utils.callbacks import Callbacks
+from utils.dataloaders import create_dataloader
+from utils.downloads import attempt_download, is_url
+from utils.general import (LOGGER, TQDM_BAR_FORMAT, check_amp, check_dataset, check_file, check_git_info,
+                           check_git_status, check_img_size, check_requirements, check_suffix, check_yaml, colorstr,
+                           get_latest_run, increment_path, init_seeds, intersect_dicts, labels_to_class_weights,
+                           labels_to_image_weights, methods, one_cycle, print_args, print_mutation, strip_optimizer,
+                           yaml_save)
+from utils.loggers import Loggers
+from utils.loggers.comet.comet_utils import check_comet_resume
+from utils.loss import ComputeLoss
+from utils.metrics import fitness
+from utils.plots import plot_evolve
+from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP, smart_optimizer,
+                               smart_resume, torch_distributed_zero_first)
+
+LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
+RANK = int(os.getenv('RANK', -1))
+print("RANK: ", RANK)
+WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+GIT_INFO = check_git_info()
+
+from train_copy import train as train_yolov5
+from train_copy import parse_opt
 
 def c2_xavier_fill(module: nn.Module) -> None:
     """
@@ -207,6 +254,7 @@ class SubnetDataset(Dataset):
             global_embedding = self.cls_model.forward_features(x)
     
         return (small[0], medium[0], large[0], bboxes, global_embedding[0]), cls
+        # return (bboxes, global_embedding[0]), cls
     
     
 def collate_fn(batch):
@@ -227,10 +275,14 @@ def collate_fn(batch):
     large_list = default_collate(large_list)
     global_embedding_list = default_collate(global_embedding_list)
     cls_list = default_collate(cls_list)
+    # return (
+    #     small_list,
+    #     medium_list,
+    #     large_list,
+    #     bbox_list,
+    #     global_embedding_list,
+    # ), cls_list
     return (
-        small_list,
-        medium_list,
-        large_list,
         bbox_list,
         global_embedding_list,
     ), cls_list
@@ -245,6 +297,7 @@ class REAL(nn.Module):
         num_heads=8,
         bias=False,
         device="cuda:0",
+        yolo_model=None,
     ):
         super().__init__()
         
@@ -254,6 +307,7 @@ class REAL(nn.Module):
         self.num_heads = num_heads
         self.bias = bias
         self.device = device
+        self.yolo_model = yolo_model
         
         # Define the network layers
         self.tf = TransformerBlockV1(dim)
@@ -269,9 +323,13 @@ class REAL(nn.Module):
             nn.Linear(448, 4)
         )
         
-    def forward(self, x, debug=False):
+    def forward(self, x, yolo_imgs, amp, debug=False):
         # Unpack the input
-        small_conv, medium_conv, large_conv, bboxes, global_embed = x
+        with torch.cuda.amp.autocast(amp):
+            small_conv, medium_conv, large_conv, yolo_pred = self.yolo_model(yolo_imgs, feature_map=True)  # forward
+        
+        bboxes, global_embed = x
+        # small_conv, medium_conv, large_conv, bboxes, global_embed = x
 
         # Move the data to the GPU
         bbox = [x.to(self.device).float() for x in bboxes]
@@ -342,9 +400,9 @@ class REAL(nn.Module):
             LOGGER.info("Q, K:        {}".format(global_local_embedding.shape))
             LOGGER.info("V:           {}".format(global_embedding.shape))
             LOGGER.info("Output:      {}".format(x.shape))
-        return x
+        return x, yolo_pred
  
-   
+
 # Masked_Attention_Efficient_Transformer_Laryngoscopy
 class MEAL(nn.Module):
     def __init__(
@@ -547,11 +605,30 @@ def train(model, params, model_name):
 
     num_epochs = params["num_epochs"]
     loss_func = params["loss_func"]
-    opt = params["optimizer"]
+    optimizer = params["optimizer"]
     train_dl = params["train_dl"]
     val_dl = params["val_dl"]
     lr_scheduler = params["lr_scheduler"]
     path2weights = params["path2weights"]
+    yolo_train_loader = params["yolo_train_dl"]
+    yolo_val_loader = params["yolo_val_dl"]
+    yolo_compute_loss = params["yolo_loss_func"]
+    yolo_scaler = params["yolo_scaler"]
+    yolo_opt = params["yolo_opt"]
+    yolo_optimizer = params["yolo_optimizer"]
+    yolo_hyp = params["yolo_hyp"]
+    yolo_scheduler = params["yolo_scheduler"]
+    amp = params["amp"]
+    yolo_callbacks = params['yolo_callbacks']
+    yolo_start_epoch = params['yolo_start_epoch']
+    ema = params['yolo_ema']
+    best_fitness = params['yolo_best_fitness'],
+    nc = params['nc']
+    ni = 0
+    accumulate = params['accumulate']
+    yolo_data_dict = params['yolo_data_dict']
+    imgsz = params['yolo_imgsz']
+    batch_size = params['yolo_batch_size']
 
     # history of loss values in each epoch
     loss_history = {
@@ -572,6 +649,22 @@ def train(model, params, model_name):
 
     model = model.to(model.device)
     
+    t0 = time.time()
+    nb = len(yolo_train_loader)  # number of batches
+    nw = max(round(hyp['warmup_epochs'] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
+    # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
+    last_opt_step = -1
+    maps = np.zeros(nc)  # mAP per class
+    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    scheduler.last_epoch = yolo_start_epoch - 1  # do not move
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    stopper, stop = EarlyStopping(patience=yolo_opt.patience), False
+    yolo_callbacks.run('on_train_start')
+    # LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
+    #             f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
+    #             f"Logging results to {colorstr('bold', save_dir)}\n"
+    #             f'Starting training for {epochs} epochs...')
+    
     def metrics_batch(output, target):
         output = torch.argmax(output, dim=1).cpu().numpy().tolist()
         target = target.cpu().numpy().tolist()
@@ -580,25 +673,64 @@ def train(model, params, model_name):
         return [weighted_score, micro_score]
 
 
-    def loss_batch(loss_func, output, target, opt=None):
-        loss = loss_func(output, target)
+    def loss_batch(
+        loss_func, output, target, 
+        yolo_pred, yolo_input,
+        last_opt_step, mloss,
+        optimizer=None
+    ):
+        yolo_imgs, yolo_targets, yolo_paths, _ = yolo_input
+        # yolov5
+        with torch.cuda.amp.autocast(amp):
+            yolo_loss, yolo_loss_items = compute_loss(yolo_pred, yolo_targets.to(model.device))  # loss scaled by batch_size
+        # yolov5
+        
+        # REAL
+        loss = loss_func(output, target) + scaler.scale(yolo_loss)
+        loss.backward()
+        # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+
+        if ni - last_opt_step >= accumulate:
+            scaler.unscale_(yolo_optimizer)  # unscale gradients
+            torch.nn.utils.clip_grad_norm_(model.yolo_model.parameters(), max_norm=10.0)  # clip gradients
+            scaler.step(yolo_optimizer)  # optimizer.step
+            scaler.update()
+            yolo_optimizer.zero_grad()
+            if ema:
+                ema.update(model.yolo_model)
+            last_opt_step = ni
+
+        # Log
+        if RANK in {-1, 0}:
+            epoch = 0
+            epochs = 300
+            i = 1
+            mloss = (mloss * i + yolo_loss_items) / (i + 1)  # update mean losses
+            mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
+            # pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+            #                         (f'{epoch}/{epochs - 1}', mem, *mloss, yolo_targets.shape[0], yolo_imgs.shape[-1]))
+            yolo_callbacks.run('on_train_batch_end', model.yolo_model, ni, yolo_imgs, yolo_targets, yolo_paths, list(mloss))
+            if yolo_callbacks.stop_training:
+                return
         with torch.no_grad():
             weighted_score, score_score = metrics_batch(output, target)
-        if opt is not None:
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+        # if optimizer is not None:
+        #     optimizer.zero_grad()
+        #     loss.backward()
+        #     optimizer.step()
         return loss.item(), (weighted_score, score_score)
 
 
-    def loss_epoch(model, loss_func, dataset_dl, opt=None):
+    def loss_epoch(model, loss_func, dataset_dl, yolo_dl, last_opt_step, optimizer):
         running_loss = 0.0
         micro_score = 0.0
         weighted_score = 0.0
         count = 0
-        for ix, (x, y) in enumerate(dataset_dl):
+        mloss = torch.zeros(3, device=model.device)
+
+        for ix, ((x, y), z) in enumerate(zip(dataset_dl, yolo_dl)):
             if model_name == "REAL":
-                _, _, _, bbox, _ = x
+                bbox, _ = x
                 ylist = []
                 for b, cls in zip(bbox, y):
                     ylist.extend([cls] * b.shape[0])
@@ -609,13 +741,20 @@ def train(model, params, model_name):
                 print("FATAL ERROR: NO MODEL NAMED {}".format(model_name))
                 return
             y = y.to(model.device)
-            output = model(x, debug=True)
-            loss_b, metric_b = loss_batch(loss_func, output, y, opt)
+            # Train yolov5 #
+            imgs, targets, paths, _ = z
+            ni = ix + nb * epoch
+            imgs = imgs.to(model.device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            # Train yolov5 #
+            output, yolo_pred = model(x, imgs, amp, debug=True)
+            # Calculate loss and metric
+            loss_b, metric_b = loss_batch(loss_func, output, y, yolo_pred, z, last_opt_step, mloss, optimizer)
             running_loss += loss_b
             if metric_b is not None:
                 micro_score += metric_b[0]
                 weighted_score += metric_b[1]
             count += 1
+            break
 
         # average loss value
         loss = running_loss / count
@@ -625,52 +764,115 @@ def train(model, params, model_name):
         return loss, (micro_metric, weighted_metric)
 
 
-    def get_lr(opt):
-        for param_group in opt.param_groups:
+    def get_lr(optimizer):
+        for param_group in optimizer.param_groups:
             return param_group["lr"]
-
+    
     # main loop
     for epoch in range(num_epochs):
+        yolo_callbacks.run('on_train_batch_start')
         # get current learning rate
-        current_lr = get_lr(opt)
+        current_lr = get_lr(optimizer)
         LOGGER.info(
             "Epoch {}/{}, current lr={}".format(epoch, num_epochs - 1, current_lr)
         )
         # train model on training dataset
         model.train()
-        train_loss, train_metric = loss_epoch(model, loss_func, train_dl, opt)
+        train_loss, train_metric = loss_epoch(model, loss_func, train_dl, yolo_train_loader, last_opt_step, optimizer)
         # collect loss and metric for training dataset
         loss_history["train"].append(train_loss)
         metric_history["train"]["micro"].append(train_metric[0])
         metric_history["train"]["weighted"].append(train_metric[1])
+        
+        # YoloV5 Scheduler
+        lr = [x['lr'] for x in yolo_optimizer.param_groups]  # for loggers
+        yolo_scheduler.step()
+        
+        if RANK in {-1, 0}:
+            # mAP
+            yolo_callbacks.run('on_train_epoch_end', epoch=epoch)
+            ema.update_attr(model.yolo_model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+            final_epoch = (epoch + 1 == num_epochs) or stopper.possible_stop
+            if not yolo_opt.noval or final_epoch:  # Calculate mAP
+                results, maps, _ = validate.run(data_dict,
+                                                batch_size=batch_size // WORLD_SIZE * 2,
+                                                imgsz=imgsz,
+                                                half=amp,
+                                                model=ema.ema,
+                                                single_cls=yolo_opt,
+                                                dataloader=yolo_val_loader,
+                                                save_dir=yolo_opt.save_dir,
+                                                plots=False,
+                                                callbacks=yolo_callbacks,
+                                                compute_loss=compute_loss)
 
-        model.eval()
-        with torch.no_grad():
-            val_loss, val_metric = loss_epoch(model, loss_func, val_dl)
-            # collect loss and metric for validation dataset
-            loss_history["val"].append(val_loss)
-            metric_history["val"]["micro"].append(val_metric[0])
-            metric_history["val"]["weighted"].append(val_metric[1])
+            # Update best mAP
+            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            stop = stopper(epoch=epoch, fitness=fi)  # early stop check
+            if fi > best_fitness:
+                best_fitness = fi
+            log_vals = list(mloss) + list(results) + lr
+            yolo_callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
-        # store best model
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_model_wts = deepcopy(model.state_dict())
-            # store weights into a local file
-            torch.save(model.state_dict(), path2weights)
-            LOGGER.info("Copied best model weights!")
+            # Save model
+            if (not nosave) or (final_epoch and not evolve):  # if save
+                ckpt = {
+                    'epoch': epoch,
+                    'best_fitness': best_fitness,
+                    'model': deepcopy(de_parallel(model)).half(),
+                    'ema': deepcopy(ema.ema).half(),
+                    'updates': ema.updates,
+                    'optimizer': optimizer.state_dict(),
+                    'opt': vars(opt),
+                    'git': GIT_INFO,  # {remote, branch, commit} if a git repo
+                    'date': datetime.now().isoformat()}
 
-        lr_scheduler.step(val_loss)
-        if current_lr != get_lr(opt):
-            LOGGER.info("Loading best model weights!")
-            model.load_state_dict(best_model_wts)
+                # Save last, best and delete
+                torch.save(ckpt, last)
+                if best_fitness == fi:
+                    torch.save(ckpt, best)
+                if opt.save_period > 0 and epoch % opt.save_period == 0:
+                    torch.save(ckpt, w / f'epoch{epoch}.pt')
+                del ckpt
+                callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
 
-        LOGGER.info(
-            "train loss: {:.6f}, val loss: {:.6f}, f1-micro: {:.2f}, f1-weighted: {:.2f}".format(
-                train_loss, val_loss, 100 * val_metric[0], 100 * val_metric[1]
-            )
-        )
-        LOGGER.info("-" * 10)
+        # EarlyStopping
+        if RANK != -1:  # if DDP training
+            broadcast_list = [stop if RANK == 0 else None]
+            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
+            if RANK != 0:
+                stop = broadcast_list[0]
+        if stop:
+            break  # must break all DDP ranks
+        print('success')
+        return
+        # model.eval()
+        # with torch.no_grad():
+        #     val_loss, val_metric = loss_epoch(model, loss_func, val_dl, yolo_val_loader, optimizer)
+        #     # collect loss and metric for validation dataset
+        #     loss_history["val"].append(val_loss)
+        #     metric_history["val"]["micro"].append(val_metric[0])
+        #     metric_history["val"]["weighted"].append(val_metric[1])
+
+        # # store best model
+        # if val_loss < best_loss:
+        #     best_loss = val_loss
+        #     best_model_wts = deepcopy(model.state_dict())
+        #     # store weights into a local file
+        #     torch.save(model.state_dict(), path2weights)
+        #     LOGGER.info("Copied best model weights!")
+
+        # lr_scheduler.step(val_loss)
+        # if current_lr != get_lr(opt):
+        #     LOGGER.info("Loading best model weights!")
+        #     model.load_state_dict(best_model_wts)
+
+        # LOGGER.info(
+        #     "train loss: {:.6f}, val loss: {:.6f}, f1-micro: {:.2f}, f1-weighted: {:.2f}".format(
+        #         train_loss, val_loss, 100 * val_metric[0], 100 * val_metric[1]
+        #     )
+        # )
+        # LOGGER.info("-" * 10)
 
     return model, loss_history, metric_history
 
@@ -687,9 +889,9 @@ def init_data_loaders(train_transforms, val_transforms, batch_size, fold):
     return train_dl, val_dl
 
 
-def init_model(model_name):
+def init_model(model_name, yolo_model):
     if model_name == "REAL":
-        model = REAL()
+        model = REAL(yolo_model=yolo_model)
     elif model_name == "MEAL":
         model = MEAL()
     loss_func = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.0, 1.5, 1.5]).cuda(), label_smoothing=0.1)
@@ -700,8 +902,245 @@ def init_model(model_name):
     return model, loss_func, opt, lr_scheduler
 
 
+def train_yolov5_main(opt, callbacks=Callbacks()):
+    if RANK in {-1, 0}:
+        print_args(vars(opt))
+        check_git_status()
+        check_requirements()
+
+    # Resume (from specified or most recent last.pt)
+    if opt.resume and not check_comet_resume(opt) and not opt.evolve:
+        last = Path(check_file(opt.resume) if isinstance(opt.resume, str) else get_latest_run())
+        opt_yaml = last.parent.parent / 'opt.yaml'  # train options yaml
+        opt_data = opt.data  # original dataset
+        if opt_yaml.is_file():
+            with open(opt_yaml, errors='ignore') as f:
+                d = yaml.safe_load(f)
+        else:
+            d = torch.load(last, map_location='cpu')['opt']
+        opt = argparse.Namespace(**d)  # replace
+        opt.cfg, opt.weights, opt.resume = '', str(last), True  # reinstate
+        if is_url(opt_data):
+            opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
+    else:
+        opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = \
+            check_file(opt.data), check_yaml(opt.cfg), check_yaml(opt.hyp), str(opt.weights), str(opt.project)  # checks
+        assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
+        if opt.evolve:
+            if opt.project == str(ROOT / 'runs/train'):  # if default project name, rename to runs/evolve
+                opt.project = str(ROOT / 'runs/evolve')
+            opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
+        if opt.name == 'cfg':
+            opt.name = Path(opt.cfg).stem  # use model.yaml as name
+        opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
+
+    # DDP mode
+    device = select_device(opt.device, batch_size=opt.batch_size)
+    if LOCAL_RANK != -1:
+        msg = 'is not compatible with YOLOv5 Multi-GPU DDP training'
+        assert not opt.image_weights, f'--image-weights {msg}'
+        assert not opt.evolve, f'--evolve {msg}'
+        assert opt.batch_size != -1, f'AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size'
+        assert opt.batch_size % WORLD_SIZE == 0, f'--batch-size {opt.batch_size} must be multiple of WORLD_SIZE'
+        assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
+        torch.cuda.set_device(LOCAL_RANK)
+        device = torch.device('cuda', LOCAL_RANK)
+        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
+    
+    return opt, device, callbacks
+
+
+def get_train_yolo_model(hyp, opt, device, callbacks):
+    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
+        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
+        opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
+    callbacks.run('on_pretrain_routine_start')
+
+    # Directories
+    w = save_dir / 'weights'  # weights dir
+    (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
+    last, best = w / 'last.pt', w / 'best.pt'
+
+    # Hyperparameters
+    if isinstance(hyp, str):
+        with open(hyp, errors='ignore') as f:
+            hyp = yaml.safe_load(f)  # load hyps dict
+    LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
+    opt.hyp = hyp.copy()  # for saving hyps to checkpoints
+
+    # Save run settings
+    if not evolve:
+        yaml_save(save_dir / 'hyp.yaml', hyp)
+        yaml_save(save_dir / 'opt.yaml', vars(opt))
+
+    # Loggers
+    data_dict = None
+    if RANK in {-1, 0}:
+        loggers = Loggers(save_dir, weights, opt, hyp, LOGGER)  # loggers instance
+
+        # Register actions
+        for k in methods(loggers):
+            callbacks.register_action(k, callback=getattr(loggers, k))
+
+        # Process custom dataset artifact link
+        data_dict = loggers.remote_dataset
+        if resume:  # If resuming runs from remote artifact
+            weights, epochs, hyp, batch_size = opt.weights, opt.epochs, opt.hyp, opt.batch_size
+
+    # Config
+    plots = not evolve and not opt.noplots  # create plots
+    cuda = device.type != 'cpu'
+    init_seeds(opt.seed + 1 + RANK, deterministic=True)
+    with torch_distributed_zero_first(LOCAL_RANK):
+        data_dict = data_dict or check_dataset(data)  # check if None
+    train_path, val_path = data_dict['train'], data_dict['val']
+    nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
+    names = {0: 'item'} if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
+    is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
+
+    # Model
+    check_suffix(weights, '.pt')  # check weights
+    pretrained = weights.endswith('.pt')
+    if pretrained:
+        with torch_distributed_zero_first(LOCAL_RANK):
+            weights = attempt_download(weights)  # download if not found locally
+        ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
+        csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
+        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
+        model.load_state_dict(csd, strict=False)  # load
+        LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
+    else:
+        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+    amp = check_amp(model)  # check AMP
+
+    # Freeze
+    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+    for k, v in model.named_parameters():
+        v.requires_grad = True  # train all layers
+        # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
+        if any(x in k for x in freeze):
+            LOGGER.info(f'freezing {k}')
+            v.requires_grad = False
+
+    # Image size
+    gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+    imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+
+    # Batch size
+    if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
+        batch_size = check_train_batch_size(model, imgsz, amp)
+        loggers.on_params_update({"batch_size": batch_size})
+
+    # Optimizer
+    nbs = 64  # nominal batch size
+    accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
+    hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
+    optimizer = smart_optimizer(model, opt.optimizer, hyp['lr0'], hyp['momentum'], hyp['weight_decay'])
+
+    # Scheduler
+    if opt.cos_lr:
+        lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
+    else:
+        lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+
+    # EMA
+    ema = ModelEMA(model) if RANK in {-1, 0} else None
+
+    # Resume
+    best_fitness, start_epoch = 0.0, 0
+    if pretrained:
+        if resume:
+            best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
+        del ckpt, csd
+
+    # DP mode
+    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
+        LOGGER.warning('WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
+                       'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
+        model = torch.nn.DataParallel(model)
+
+    # SyncBatchNorm
+    if opt.sync_bn and cuda and RANK != -1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+        LOGGER.info('Using SyncBatchNorm()')
+
+    # Trainloader
+    train_loader, dataset = create_dataloader(train_path,
+                                              imgsz,
+                                              batch_size // WORLD_SIZE,
+                                              gs,
+                                              single_cls,
+                                              hyp=hyp,
+                                              augment=True,
+                                              cache=None if opt.cache == 'val' else opt.cache,
+                                              rect=opt.rect,
+                                              rank=LOCAL_RANK,
+                                              workers=workers,
+                                              image_weights=opt.image_weights,
+                                              quad=opt.quad,
+                                              prefix=colorstr('train: '),
+                                              shuffle=True,
+                                              seed=opt.seed)
+    labels = np.concatenate(dataset.labels, 0)
+    mlc = int(labels[:, 0].max())  # max label class
+    assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
+
+    # Process 0
+    if RANK in {-1, 0}:
+        val_loader = create_dataloader(val_path,
+                                       imgsz,
+                                       batch_size // WORLD_SIZE * 2,
+                                       gs,
+                                       single_cls,
+                                       hyp=hyp,
+                                       cache=None if noval else opt.cache,
+                                       rect=True,
+                                       rank=-1,
+                                       workers=workers * 2,
+                                       pad=0.5,
+                                       prefix=colorstr('val: '))[0]
+
+        if not resume:
+            if not opt.noautoanchor:
+                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
+            model.half().float()  # pre-reduce anchor precision
+
+        callbacks.run('on_pretrain_routine_end', labels, names)
+
+    # DDP mode
+    if cuda and RANK != -1:
+        model = smart_DDP(model)
+
+    # Model attributes
+    nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
+    hyp['box'] *= 3 / nl  # scale to layers
+    hyp['cls'] *= nc / 80 * 3 / nl  # scale to classes and layers
+    hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+    hyp['label_smoothing'] = opt.label_smoothing
+    model.nc = nc  # attach number of classes to model
+    model.hyp = hyp  # attach hyperparameters to model
+    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    model.names = names
+    
+    return model, train_loader, val_loader, dataset, optimizer, scheduler, hyp,\
+        start_epoch, ema, best_fitness, nc, accumulate, data_dict, imgsz, batch_size
+
+
 if __name__ == "__main__":
     
+    opt = parse_opt()
+    callbacks=Callbacks()
+    opt, device, callbacks = train_yolov5_main(opt, callbacks)
+    yolo_model, train_loader, val_loader, dataset, optimizer, scheduler, \
+        hyp, start_epoch, ema, best_fitness, nc, accumulate, data_dict, imgsz, batch_size = \
+        get_train_yolo_model(opt.hyp, opt, device, callbacks)
+    yolo_model.train()
+    amp = check_amp(yolo_model)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    compute_loss = ComputeLoss(yolo_model)
     fold = 0
     model_name="REAL"
     if model_name == "REAL":
@@ -720,19 +1159,37 @@ if __name__ == "__main__":
     val_transforms = None
     train_dl, val_dl = init_data_loaders(
         train_transforms, val_transforms,
-        batch_size=256,
+        batch_size=2,
         fold=fold,
     )
-
-    model, loss_func, opt, lr_scheduler = init_model(model_name=model_name)
+    
+    model, loss_func, optimizer, lr_scheduler = init_model(model_name=model_name, yolo_model=yolo_model)
     params = {
-        "num_epochs": 70,
-        "optimizer": opt,
+        "num_epochs": 1,
+        "optimizer": optimizer,
         "loss_func": loss_func,
         "train_dl": train_dl,
         "val_dl": val_dl,
         "lr_scheduler": lr_scheduler,
         "path2weights": path2weights,
+        "yolo_train_dl": train_loader,
+        "yolo_val_dl": val_loader,
+        "yolo_loss_func": compute_loss,
+        "yolo_scaler": scaler,
+        "yolo_opt": opt,
+        "yolo_optimizer": optimizer,
+        "yolo_scheduler": scheduler,
+        "yolo_hyp": hyp,
+        "amp": amp,
+        "yolo_callbacks": callbacks,
+        "yolo_start_epoch": start_epoch,
+        "yolo_ema": ema,
+        "yolo_best_fitness": best_fitness,
+        "nc": nc,
+        "accumulate": accumulate,
+        "yolo_data_dict": data_dict,
+        "yolo_imgsz": imgsz,
+        "yolo_batch_size": batch_size,
     }
     
     model, loss_hist, metric_hist = train(
@@ -740,6 +1197,3 @@ if __name__ == "__main__":
         params=params,
         model_name=model_name,
     )
-    
-    
-    

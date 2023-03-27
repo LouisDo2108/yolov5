@@ -214,7 +214,7 @@ class AttentionV1(nn.Module):
         )
 
         out = self.project_out(out)
-        return out
+        return out, attn.mean(dim=1)
 
 
 class AttentionV2(nn.Module):
@@ -324,7 +324,7 @@ class TransformerBlockV1(nn.Module):
         self.ffn = GFeedForward(dim, ffn_expansion_factor, bias)
 
     def forward(self, x, feature, debug=False):
-        x = x + self.attn(self.norm1(x), feature, debug=debug)
+        x = x + self.attn(self.norm1(x), feature, debug=debug)[0]
         x = x + self.ffn(self.norm2(x))
 
         return x

@@ -39,7 +39,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from my_scripts.subnet import *
+from my_scripts.train_subnet import *
 from models.common import DetectMultiBackend
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
@@ -54,7 +54,7 @@ from utils.torch_utils import select_device, smart_inference_mode
 def get_cls_model(fold):
     model = timm.create_model("tf_efficientnet_b0", num_classes=4)
     checkpoint = torch.load(
-        "/home/dtpthao/workspace/yolov5/tf{}.pth".format(fold), map_location=torch.device('cpu')
+        "/home/dtpthao/workspace/yolov5/my_scripts/checkpoints/cls/tf{}.pth".format(fold), map_location=torch.device('cpu')
     )["model"]
     model.load_state_dict(overwrite_key(checkpoint))
     model.cuda()
@@ -63,15 +63,15 @@ def get_cls_model(fold):
 
 def get_subnet(model_path, v=1):
     if v == 1:
-        subnet = SubnetV1(roip_output_size=(8, 8), dim=896)
-    elif v == 2:
-        subnet = SubnetV2(roip_output_size=(8, 8), dim=896)
-    elif v == 3:
-        subnet = SubnetV3(roip_output_size=(8, 8), dim=896)
+        subnet = REAL(roip_output_size=(8, 8), dim=896)
     elif v == 41:
-        subnet = SubnetV41(dim=896)
-    elif v == 43:
-        subnet = SubnetV43(roip_output_size=(8, 8), dim=896)
+        subnet = MEAL(dim=896)
+    # elif v == 2:
+    #     subnet = SubnetV2(roip_output_size=(8, 8), dim=896)
+    # elif v == 3:
+    #     subnet = SubnetV3(roip_output_size=(8, 8), dim=896)
+    # elif v == 43:
+    #     subnet = SubnetV43(roip_output_size=(8, 8), dim=896)
     subnet.load_state_dict(torch.load(model_path))
     subnet.cuda()
     return subnet
@@ -241,8 +241,8 @@ def run(
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
     subnet = get_subnet(
-        model_path="/home/dtpthao/workspace/yolov5/my_scripts/subnet_v41_ce_100epochs_fold_0_fix.pt", 
-        v=41)
+        model_path="/home/dtpthao/workspace/yolov5/my_scripts/checkpoints/subnet_v1_gap_100epochs_fold_0_fix.pt", 
+        v=1)
     cls_model.eval()
     subnet.eval()
     # New #
@@ -303,7 +303,7 @@ def run(
             
             
             # Since an image might have multiple bbox, hence multiple classifications, we do a majority voting
-            if isinstance(subnet, SubnetV1) or isinstance(subnet, SubnetV2) or isinstance(subnet, SubnetV3):
+            if isinstance(subnet, REAL):# or isinstance(subnet, SubnetV2) or isinstance(subnet, SubnetV3):
                 last_index = 0
                 for box in bboxes:
                     if len(box) <= 0:
@@ -395,7 +395,7 @@ def run(
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
-
+    # np.save('/home/dtpthao/workspace/yolov5/real.npy', np.array(stats, dtype=object), allow_pickle=True)
     # Print results
     pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
