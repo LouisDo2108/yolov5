@@ -6,6 +6,11 @@ aim_folds/*
 aim_folds_bigger_box/*
 *.pth
 *.pt
+aim*/
+wandb/
+*.zip
+gradcams/
+*.npy
 
 # Repo-specific GitIgnore ----------------------------------------------------------------------------------------------
 *.jpg
